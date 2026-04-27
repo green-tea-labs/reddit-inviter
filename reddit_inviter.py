@@ -65,14 +65,18 @@ SOURCE_SUBREDDITS = [
     "HotAndCold",
 ]
 
-# Community to invite users to (as typed into the search field)
+# Community to invite users to.
 INVITE_COMMUNITY = "pineapple cactus"
 
 # Invite community display name to match in search results (regex, case-insensitive)
 INVITE_COMMUNITY_PATTERN = r"(?i)pineapple.?cactus"
 
+# Text typed into the invite field. On the current Reddit UI this becomes the
+# message sent to the user, so change this if you want a different invite note.
+INVITE_MESSAGE_TEXT = "Hey! Just a friendly invite from a quiz sub/community. Saw you liked similar subs, no worries if it’s not your thing."
+
 # A post must have at least this many comments to qualify
-MIN_COMMENTS = 20
+MIN_COMMENTS = 10
 
 # Stop after this many consecutive "Unknown error" responses
 # (signals rate-limit OR user already invited)
@@ -84,16 +88,20 @@ MAX_FEED_SCROLLS = 25
 # Maximum comment-list scrolls before considering all users processed
 MAX_COMMENT_SCROLLS = 150
 
+# Consecutive comment scrolls that show no new visible content before the post
+# is treated as exhausted and the script returns to the feed.
+MAX_STALLED_COMMENT_SCROLLS = 2
+
 # Stop the entire run after this many seconds.
 MAX_RUNTIME_SECONDS = 30 * 60
 
 # Base delay between actions in seconds — increase if the app is slow to respond
-ACTION_DELAY = 0.5
+ACTION_DELAY = 0.3
 
 # Randomize action timing a bit so clicks and scrolls are less robotic.
-# Example: 1.5 seconds becomes roughly 1.1 to 2.0 seconds.
-ACTION_DELAY_JITTER_MIN = 0.75
-ACTION_DELAY_JITTER_MAX = 1.35
+# Example: 1.5 seconds becomes roughly 1.2 to 1.7 seconds.
+ACTION_DELAY_JITTER_MIN = 0.40
+ACTION_DELAY_JITTER_MAX = 0.64
 
 # Small movement jitter so coordinate taps and swipes are less uniform.
 TAP_JITTER_PX = 10
@@ -113,6 +121,7 @@ RESOURCE_IDS = {
     "overflow_menu": "",      # e.g. "com.reddit.frontpage:id/overflow_menu"
     "invite_button": "",      # e.g. "com.reddit.frontpage:id/invite_to_community"
     "search_field":  "",      # e.g. "com.reddit.frontpage:id/community_search_input"
+    "message_field": "",      # e.g. "com.reddit.frontpage:id/invite_message_input"
 }
 
 # Relative tap fallbacks for the current Reddit Android layout.
@@ -208,7 +217,7 @@ def log_timeout_and_stop() -> bool:
 def go_back(d, times: int = 1):
     for _ in range(times):
         d.press("back")
-        pause(0.8)
+        pause(0.5)
 
 
 def toast_visible(d, text: str, timeout: float = 3.0) -> bool:
@@ -217,6 +226,79 @@ def toast_visible(d, text: str, timeout: float = 3.0) -> bool:
         return d(textContains=text).wait(timeout=timeout)
     except Exception:
         return False
+
+
+def _visible_feedback_texts(d) -> list[str]:
+    """Collect short-lived UI feedback text from visible text and descriptions."""
+    texts: list[str] = []
+
+    try:
+        xml = d.dump_hierarchy(pretty=True)
+        root = ET.fromstring(xml)
+    except Exception:
+        return texts
+
+    for node in root.iter("node"):
+        for value in (node.attrib.get("text", ""), node.attrib.get("content-desc", "")):
+            cleaned = value.strip()
+            if cleaned and cleaned not in texts:
+                texts.append(cleaned)
+
+    return texts
+
+
+def wait_for_feedback_message(d, timeout: float = 3.0) -> tuple[str, str, list[str]]:
+    """Return (message, source, observed_toasts) for post-invite feedback."""
+    deadline = time.monotonic() + timeout
+    observed_toasts: list[str] = []
+    feedback_patterns = [
+        r"(?i)unknown error",
+        r"(?i)successfully invited",
+        r"(?i)you have successfully invited",
+        r"(?i)invite sent",
+        r"(?i)invited",
+        r"(?i)success",
+        r"(?i)failed",
+        r"(?i)try again",
+        r"(?i)already invited",
+        r"(?i)rate limit",
+    ]
+
+    while time.monotonic() < deadline:
+        toast_wait = min(0.5, max(0.1, deadline - time.monotonic()))
+        try:
+            message = d.toast.get_message(wait_timeout=toast_wait, default=None)
+            if message:
+                cleaned = str(message).strip()
+                if cleaned and cleaned not in observed_toasts:
+                    observed_toasts.append(cleaned)
+                if cleaned:
+                    return (cleaned, "toast", observed_toasts)
+        except Exception:
+            pass
+
+        for pattern in feedback_patterns:
+            for selector in (
+                d(textMatches=pattern),
+                d(descriptionMatches=pattern),
+            ):
+                try:
+                    if selector.exists(timeout=0.2):
+                        info = getattr(selector, "info", {}) or {}
+                        for key in ("text", "contentDescription"):
+                            value = (info.get(key) or "").strip()
+                            if value:
+                                return (value, "ui-selector", observed_toasts)
+                except Exception:
+                    continue
+
+        for text in _visible_feedback_texts(d):
+            if any(re.search(pattern, text) for pattern in feedback_patterns):
+                return (text, "ui-hierarchy", observed_toasts)
+
+        pause(0.1)
+
+    return ("", "", observed_toasts)
 
 
 def find_element(d, resource_id_key: str, **text_kwargs):
@@ -249,7 +331,7 @@ def dismiss_nsfw_modal(d, timeout: float = 3.5) -> bool:
             if selector.exists(timeout=0.2):
                 log("NSFW modal detected — pressing Continue.")
                 safe_click(d, selector)
-                pause(1.5)
+                pause(0.8)
                 return True
         pause(0.3)
 
@@ -495,6 +577,75 @@ def _find_send_button_right_of_search(d) -> tuple[int, int] | None:
     return None
 
 
+def _invite_message_field(d, search_field):
+    """Best-effort lookup for the optional invite message text box."""
+    if RESOURCE_IDS["message_field"]:
+        candidate = d(resourceId=RESOURCE_IDS["message_field"])
+        if candidate.exists(timeout=1):
+            return candidate
+
+    candidates = []
+    for field in iter_selector_elements(d(className="android.widget.EditText")):
+        try:
+            info = getattr(field, "info", {}) or {}
+            text = (info.get("text") or "").strip()
+            content_description = (info.get("contentDescription") or "").strip()
+            resource_name = (
+                info.get("resourceName")
+                or info.get("resourceId")
+                or info.get("resource-id")
+                or ""
+            ).strip()
+            haystack = " ".join((text, content_description, resource_name)).lower()
+            if any(token in haystack for token in ("message", "note", "invite")):
+                return field
+            candidates.append(field)
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+
+    if search_field is not None and len(candidates) > 1:
+        try:
+            search_center = element_center(search_field)
+            remaining = []
+            for field in candidates:
+                try:
+                    if element_center(field) != search_center:
+                        remaining.append(field)
+                except Exception:
+                    remaining.append(field)
+            if remaining:
+                candidates = remaining
+        except Exception:
+            pass
+
+    return candidates[-1]
+
+
+def populate_invite_message(d, username: str, search_field) -> bool:
+    """Fill the optional invite message field if configured and present."""
+    if not INVITE_MESSAGE_TEXT.strip():
+        return False
+
+    message_field = _invite_message_field(d, search_field)
+    if message_field is None:
+        log(f"  [{username}] Invite message field not found. Leaving default message.")
+        return False
+
+    try:
+        safe_click(d, message_field)
+        message_field.clear_text()
+        message_field.set_text(INVITE_MESSAGE_TEXT)
+        log(f"  [{username}] Applied custom invite message.")
+        pause(0.6)
+        return True
+    except Exception as exc:
+        log(f"  [{username}] Could not set custom invite message: {exc}")
+        return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 1: Open r/dailyguess via deep link
 # ─────────────────────────────────────────────────────────────────────────────
@@ -534,13 +685,13 @@ def find_qualifying_post(d, deadline: float) -> bool:
             if top > int(screen_height * 0.8) or bottom >= screen_height:
                 log(f"  Found qualifying post with {count} comments, but it is too low on screen. Scrolling it into view...")
                 safe_swipe_up(d, scale=0.35)
-                pause(1.5)
+                pause(0.7)
                 break
 
             log(f"  Found feed card with {count} comments — tapping post...")
             x, y = header_tap_point(bounds)
             safe_tap_point(d, x, y)
-            pause(3)
+            pause(2.2)
             dismiss_nsfw_modal(d)
             return True
 
@@ -560,7 +711,7 @@ def find_qualifying_post(d, deadline: float) -> bool:
                     if count >= MIN_COMMENTS:
                         log(f"  Found: '{text}' ({count} comments) — tapping post...")
                         safe_click(d, el)
-                        pause(3)
+                        pause(2.2)
                         dismiss_nsfw_modal(d)
                         return True
                 except Exception:
@@ -568,7 +719,7 @@ def find_qualifying_post(d, deadline: float) -> bool:
 
         log(f"  Scroll {scroll_num + 1}/{MAX_FEED_SCROLLS} — no qualifying post yet.")
         safe_swipe_up(d, scale=0.8)
-        pause(1.5)
+        pause(0.9)
 
     log("ERROR: No qualifying post found after maximum scrolls.")
     return False
@@ -580,7 +731,7 @@ def find_qualifying_post(d, deadline: float) -> bool:
 
 def filter_by_new(d):
     log("Sorting comments by New...")
-    pause(2)  # let comments load
+    pause(1.2)  # let comments load
 
     sort_btn = None
 
@@ -620,7 +771,7 @@ def filter_by_new(d):
             safe_click(d, sort_btn)
     else:
         safe_click(d, sort_btn)
-    pause(1.5)
+    pause(0.8)
 
     selected = False
     for option in iter_selector_elements(d(resourceId="comment_sort_option_text")):
@@ -634,7 +785,7 @@ def filter_by_new(d):
             continue
 
     if selected:
-        pause(1.5)
+        pause(0.8)
         log("  Sort set to New.")
     else:
         log("  WARNING: 'New' option not found in sort menu.")
@@ -692,6 +843,23 @@ def get_visible_usernames(d) -> list[tuple]:
     return results
 
 
+def visible_comment_snapshot(d) -> tuple[str, ...]:
+    """Return a stable snapshot of the visible comments for scroll-progress checks."""
+    snapshot = []
+
+    for description, bounds in visible_comment_headers(d):
+        username = normalize_username(extract_comment_author(description))
+        snapshot.append(f"{username}@{bounds}" if username else description)
+
+    if snapshot:
+        return tuple(snapshot)
+
+    for _, username in get_visible_usernames(d):
+        snapshot.append(normalize_username(username))
+
+    return tuple(snapshot)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 5: Invite a single user (called when their profile screen is open)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -737,7 +905,7 @@ def invite_user(d, username: str) -> str:
             if overflow is not None:
                 log(f"  [{username}] Coordinate tap missed — retrying overflow by description.")
                 safe_click(d, overflow)
-                pause(1.2)
+                pause(0.9)
                 invite_btn = d(textMatches=r"(?i)invite.*communit|communit.*invite|^invite$")
 
     if not invite_btn.exists(timeout=3):
@@ -748,10 +916,10 @@ def invite_user(d, username: str) -> str:
     if not invite_btn.exists(timeout=3):
         log(f"  [{username}] Invite button selector not found — using coordinate fallback.")
         safe_tap_relative(d, *COORDINATE_FALLBACKS["profile_invite_bottom_item"])
-        pause(2)
+        pause(1.0)
     else:
         safe_click(d, invite_btn)
-        pause(2)
+        pause(1.0)
 
     # If the coordinate fallback missed and we are still on the profile/menu, stop here.
     search_field = find_element(d, "search_field", className="android.widget.EditText")
@@ -762,8 +930,8 @@ def invite_user(d, username: str) -> str:
     # ── Type the community name in the search field ───────────────────────────
     safe_click(d, search_field)
     search_field.clear_text()
-    search_field.set_text(INVITE_COMMUNITY)
-    pause(2.5)  # wait for search results to populate
+    search_field.set_text(INVITE_MESSAGE_TEXT)
+    pause(2.0)  # wait for search results to populate
 
     # ── Tap the correct community result ─────────────────────────────────────
     community_result = d(textMatches=INVITE_COMMUNITY_PATTERN)
@@ -772,13 +940,19 @@ def invite_user(d, username: str) -> str:
         return "not_found"
 
     safe_click(d, community_result)
-    pause(1.5)
+    pause(1.0)
+    populate_invite_message(d, username, search_field)
 
     if DRY_RUN:
         log(f"  [{username}] DRY RUN — skipping send tap.")
         return "success"
 
     # ── Tap send / paper-plane / confirm button ───────────────────────────────
+    try:
+        d.toast.reset()
+    except Exception:
+        pass
+
     sent = False
 
     # Strategy 1: text-based confirm button
@@ -786,7 +960,6 @@ def invite_user(d, username: str) -> str:
     if confirm_btn.exists(timeout=2):
         safe_click(d, confirm_btn)
         sent = True
-        pause(2)
 
     # Strategy 2: description-based (covers icon/paper-plane buttons)
     if not sent:
@@ -795,7 +968,6 @@ def invite_user(d, username: str) -> str:
             if btn.exists(timeout=1):
                 safe_click(d, btn)
                 sent = True
-                pause(2)
                 break
 
     # Strategy 3: XML geometry — first clickable element to the right of the EditText
@@ -805,23 +977,35 @@ def invite_user(d, username: str) -> str:
             log(f"  [{username}] Tapping send button via XML geometry at {tap}.")
             safe_tap_point(d, *tap)
             sent = True
-            pause(2)
 
     if not sent:
         log(f"  [{username}] No explicit send button found — treating as auto-confirmed.")
-        pause(1)
 
-    # ── Detect result via toast ───────────────────────────────────────────────
-    if toast_visible(d, "Unknown error", timeout=3):
-        log(f"  [{username}] 'Unknown error' — already invited or rate-limited.")
-        return "error"
+    # ── Detect result via toast / snackbar / transient feedback text ─────────
+    feedback_message, feedback_source, observed_toasts = wait_for_feedback_message(d, timeout=4.5)
+    if observed_toasts:
+        log(f"  [{username}] Toast API saw: {' | '.join(observed_toasts)}")
+    else:
+        log(f"  [{username}] Toast API saw nothing.")
 
-    # Any success-flavoured toast
-    if (toast_visible(d, "Invite sent", timeout=2)
-            or toast_visible(d, "invited", timeout=2)
-            or toast_visible(d, "success", timeout=2)):
-        log(f"  [{username}] Invite sent!")
-        return "success"
+    if feedback_message:
+        if feedback_source:
+            log(f"  [{username}] Feedback after send ({feedback_source}): {feedback_message}")
+        else:
+            log(f"  [{username}] Feedback after send: {feedback_message}")
+        normalized_feedback = feedback_message.lower()
+
+        if "unknown error" in normalized_feedback:
+            log(f"  [{username}] Invite failed — already invited or rate-limited.")
+            return "error"
+
+        if any(token in normalized_feedback for token in ("successfully invited", "invite sent", "invited", "success")):
+            log(f"  [{username}] Invite sent!")
+            return "success"
+
+        if any(token in normalized_feedback for token in ("failed", "try again", "rate limit", "already invited")):
+            log(f"  [{username}] Invite failed based on feedback text.")
+            return "error"
 
     # No toast detected — Reddit sometimes gives no feedback on success
     log(f"  [{username}] No toast detected — assuming success.")
@@ -897,12 +1081,39 @@ def navigate_back_to_comments(d, max_backs: int = 8):
     return False
 
 
-def run_invite_loop(d, deadline: float):
-    visited_users: set[str] = load_invited_users()
+def navigate_back_to_feed(d, max_backs: int = 10):
+    """Press back until the subreddit feed is visible, logging each step."""
+    for i in range(max_backs):
+        screen = current_screen(d)
+        log(f"  [nav] screen={screen} while returning to feed (step {i})")
+        if screen == "feed":
+            return True
+        go_back(d)
+        pause(1.2)
+    log("  [nav] WARNING: could not navigate back to feed after max backs.")
+    return False
+
+
+def attempt_comment_scroll(d, scale: float | None = None, use_direct_scroll: bool = False) -> bool:
+    """Scroll the comment list and return True if the visible content changed."""
+    before = visible_comment_snapshot(d)
+    if use_direct_scroll:
+        safe_comment_scroll(d)
+    else:
+        if scale is None:
+            raise ValueError("scale is required when use_direct_scroll is False")
+        safe_swipe_up(d, scale=scale)
+    pause(0.9)
+    after = visible_comment_snapshot(d)
+    return after != before
+
+
+def run_invite_loop(d, deadline: float, visited_users: set[str]) -> tuple[str, int]:
     tap_miss_counts: dict[str, int] = {}
     low_viewport_deferred: set[str] = set()
     consecutive_errors: int = 0
     total_invited: int = 0
+    stalled_scrolls: int = 0
     _, screen_height = d.window_size()
     bottom_viewport_threshold = int(screen_height * 0.86)
 
@@ -911,7 +1122,7 @@ def run_invite_loop(d, deadline: float):
     for scroll_num in range(MAX_COMMENT_SCROLLS + 1):
         if timed_out(deadline):
             log_timeout_and_stop()
-            break
+            return ("timed_out", total_invited)
 
         usernames = get_visible_usernames(d)
         new_users = [
@@ -922,20 +1133,30 @@ def run_invite_loop(d, deadline: float):
 
         if not new_users:
             if scroll_num >= MAX_COMMENT_SCROLLS:
-                log("Reached maximum comment scrolls. Stopping.")
-                break
+                log("Reached maximum comment scrolls on this post. Returning to the feed.")
+                return ("post_exhausted", total_invited)
             log(f"All visible users processed — scrolling for more comments ({scroll_num + 1}/{MAX_COMMENT_SCROLLS})...")
-            safe_swipe_up(d, scale=0.6)
-            pause(1.5)
+            if attempt_comment_scroll(d, scale=0.6):
+                stalled_scrolls = 0
+            else:
+                stalled_scrolls += 1
+                log(
+                    f"No new comments appeared after scroll "
+                    f"({stalled_scrolls}/{MAX_STALLED_COMMENT_SCROLLS})."
+                )
+                if stalled_scrolls >= MAX_STALLED_COMMENT_SCROLLS:
+                    log("Comment thread appears exhausted. Returning to the feed for another post.")
+                    return ("post_exhausted", total_invited)
             continue
 
+        stalled_scrolls = 0
         should_scroll_for_more = False
 
         for point, username in new_users:
             if timed_out(deadline):
                 log_timeout_and_stop()
-                log(f"Invite loop complete. Total invited this session: {total_invited}")
-                return
+                log(f"Invite loop complete. Total invited on this post: {total_invited}")
+                return ("timed_out", total_invited)
 
             normalized = normalize_username(username)
 
@@ -955,7 +1176,7 @@ def run_invite_loop(d, deadline: float):
             except Exception:
                 log(f"  Could not tap u/{username}. Skipping.")
                 continue
-            pause(2.5)
+            pause(1.6)
             dismiss_nsfw_modal(d)
 
             if _on_comment_screen(d):
@@ -976,7 +1197,7 @@ def run_invite_loop(d, deadline: float):
             # screens the invite flow opened (Reddit sometimes auto-dismisses
             # the picker, leaving us already at the profile).
             navigate_back_to_comments(d)
-            pause(1.0)
+            pause(0.6)
 
             if result == "success":
                 visited_users.add(normalized)
@@ -986,24 +1207,36 @@ def run_invite_loop(d, deadline: float):
                 log(f"  Invited. Total this session: {total_invited}")
 
             elif result == "error":
+                visited_users.add(normalized)
                 consecutive_errors += 1
+                log(f"  Marking u/{username} as handled for this session after error.")
                 log(f"  Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     log(
                         f"Reached {MAX_CONSECUTIVE_ERRORS} consecutive errors — "
                         f"stopping to respect rate limit."
                     )
-                    log(f"Total invited this session: {total_invited}")
-                    return
+                    log(f"Total invited on this post: {total_invited}")
+                    return ("rate_limited", total_invited)
 
             # 'not_found' does not count toward the error limit
 
         if should_scroll_for_more:
-            safe_comment_scroll(d)
-            pause(1.5)
+            if attempt_comment_scroll(d, use_direct_scroll=True):
+                stalled_scrolls = 0
+            else:
+                stalled_scrolls += 1
+                log(
+                    f"Comment scroll did not reveal new profiles "
+                    f"({stalled_scrolls}/{MAX_STALLED_COMMENT_SCROLLS})."
+                )
+                if stalled_scrolls >= MAX_STALLED_COMMENT_SCROLLS:
+                    log("Comment thread appears exhausted. Returning to the feed for another post.")
+                    return ("post_exhausted", total_invited)
             continue
 
-    log(f"Invite loop complete. Total invited this session: {total_invited}")
+    log(f"Invite loop complete. Total invited on this post: {total_invited}")
+    return ("completed", total_invited)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1013,6 +1246,8 @@ def run_invite_loop(d, deadline: float):
 def main():
     deadline = time.monotonic() + MAX_RUNTIME_SECONDS
     source_subreddit = random.choice(SOURCE_SUBREDDITS)
+    visited_users = load_invited_users()
+    total_invited = 0
 
     if DRY_RUN:
         log("=" * 60)
@@ -1055,20 +1290,38 @@ def main():
     try:
         open_subreddit(d, source_subreddit)
 
-        if not find_qualifying_post(d, deadline):
+        while not timed_out(deadline):
+            if not find_qualifying_post(d, deadline):
+                if timed_out(deadline):
+                    log("Script complete.")
+                    return
+                log("Could not find a qualifying post. Exiting.")
+                sys.exit(1)
+
             if timed_out(deadline):
+                log_timeout_and_stop()
                 log("Script complete.")
                 return
-            log("Could not find a qualifying post. Exiting.")
-            sys.exit(1)
 
-        if timed_out(deadline):
-            log_timeout_and_stop()
-            log("Script complete.")
-            return
+            filter_by_new(d)
+            result, invited_count = run_invite_loop(d, deadline, visited_users)
+            total_invited += invited_count
 
-        filter_by_new(d)
-        run_invite_loop(d, deadline)
+            if result == "timed_out":
+                break
+            if result == "rate_limited":
+                break
+            if result == "completed":
+                break
+            if result == "post_exhausted":
+                if timed_out(deadline):
+                    break
+                navigate_back_to_feed(d)
+                pause(1.5)
+                log("Post exhausted. Looking for another post with enough comments...")
+                continue
+
+        log(f"Session invite total: {total_invited}")
     except InputInjectionBlocked:
         log("The phone is blocking simulated taps/swipes from ADB and UIAutomator.")
         log("On POCO/Xiaomi devices, enable Developer options > USB debugging (Security settings).")
