@@ -41,11 +41,14 @@ into the RESOURCE_IDS section below for faster, more reliable matching.
 If left as empty strings (""), the script falls back to text-based selectors.
 """
 
+import json
 import random
 import re
+import socket
 import sys
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 
 import adbutils
@@ -63,7 +66,12 @@ SOURCE_SUBREDDITS = [
     "dailyguess",
     "dailymix",
     "HotAndCold",
+    "syllo",
+    "QuizPlanetGame"
 ]
+
+# Feed sort to use when opening the source subreddit.
+SOURCE_FEED_SORT = "new"
 
 # Community to invite users to.
 INVITE_COMMUNITY = "pineapple cactus"
@@ -83,17 +91,17 @@ MIN_COMMENTS = 10
 MAX_CONSECUTIVE_ERRORS = 7
 
 # Maximum feed scrolls before giving up on finding a qualifying post
-MAX_FEED_SCROLLS = 25
+MAX_FEED_SCROLLS = 125
 
 # Maximum comment-list scrolls before considering all users processed
-MAX_COMMENT_SCROLLS = 150
+MAX_COMMENT_SCROLLS = 25
 
 # Consecutive comment scrolls that show no new visible content before the post
 # is treated as exhausted and the script returns to the feed.
 MAX_STALLED_COMMENT_SCROLLS = 2
 
 # Stop the entire run after this many seconds.
-MAX_RUNTIME_SECONDS = 30 * 60
+MAX_RUNTIME_SECONDS = 60 * 60
 
 # Base delay between actions in seconds — increase if the app is slow to respond
 ACTION_DELAY = 0.3
@@ -111,6 +119,8 @@ SWIPE_X_JITTER_PX = 28
 
 # File that stores usernames already invited across previous runs.
 INVITED_USERS_FILE = Path(__file__).with_name("invited_users.txt")
+INVITE_STATUS_FILE = Path(__file__).with_name("invite_status.json")
+DAILY_TALLY_FILE = Path(__file__).with_name("daily_invite_tally.txt")
 
 # ── Optional: paste resource-id values found via discover_ui.py ──────────────
 # Leave as "" to use text/description-based selectors (default, always works).
@@ -203,6 +213,99 @@ def record_invited_user(username: str):
             handle.write(normalized + "\n")
     except Exception as exc:
         log(f"WARNING: Could not write invited user '{normalized}': {exc}")
+
+
+def count_total_invited_users() -> int:
+    return len(load_invited_users())
+
+
+def count_today_successes() -> int:
+    today = datetime.now().date().isoformat()
+    _, successful_count = _read_daily_tallies().get(today, (0, 0))
+    return successful_count
+
+
+def local_lan_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
+def _read_daily_tallies() -> dict[str, tuple[int, int]]:
+    tallies: dict[str, tuple[int, int]] = {}
+
+    if not DAILY_TALLY_FILE.exists():
+        return tallies
+
+    try:
+        for raw_line in DAILY_TALLY_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            match = re.fullmatch(
+                r"(\d{4}-\d{2}-\d{2})\s+processed=(\d+)\s+successful=(\d+)",
+                line,
+            )
+            if not match:
+                continue
+
+            tally_date, processed_count, successful_count = match.groups()
+            tallies[tally_date] = (int(processed_count), int(successful_count))
+    except Exception as exc:
+        log(f"WARNING: Could not read daily tally file: {exc}")
+
+    return tallies
+
+
+def _write_daily_tallies(tallies: dict[str, tuple[int, int]]):
+    lines = [
+        f"{tally_date} processed={processed_count} successful={successful_count}"
+        for tally_date, (processed_count, successful_count) in sorted(tallies.items())
+    ]
+
+    try:
+        DAILY_TALLY_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception as exc:
+        log(f"WARNING: Could not write daily tally file: {exc}")
+
+
+def ensure_daily_tally_entry():
+    today = datetime.now().date().isoformat()
+    tallies = _read_daily_tallies()
+    if today not in tallies:
+        tallies[today] = (0, 0)
+        _write_daily_tallies(tallies)
+
+
+def update_daily_tally(processed_delta: int = 0, successful_delta: int = 0):
+    today = datetime.now().date().isoformat()
+    tallies = _read_daily_tallies()
+    processed_count, successful_count = tallies.get(today, (0, 0))
+    tallies[today] = (
+        processed_count + processed_delta,
+        successful_count + successful_delta,
+    )
+    _write_daily_tallies(tallies)
+
+
+def write_status_file(state: str, session_successes: int = 0, source_subreddit: str = ""):
+    payload = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "state": state,
+        "today_successful": count_today_successes(),
+        "total_invited": count_total_invited_users(),
+        "session_successful": session_successes,
+        "source_subreddit": source_subreddit,
+        "lan_hint": local_lan_ip(),
+    }
+    try:
+        INVITE_STATUS_FILE.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception as exc:
+        log(f"WARNING: Could not write status file: {exc}")
 
 
 def timed_out(deadline: float) -> bool:
@@ -528,6 +631,15 @@ def visible_post_cards(d) -> list[tuple[str, str]]:
     return cards
 
 
+def post_card_key(description: str) -> str:
+    return re.sub(r"\s+", " ", description).strip().lower()
+def summarize_post_description(description: str, limit: int = 100) -> str:
+    summary = re.sub(r"\s+", " ", description).strip()
+    if len(summary) <= limit:
+        return summary
+    return summary[: limit - 3] + "..."
+
+
 def visible_comment_headers(d) -> list[tuple[str, str]]:
     """Return visible Reddit comment headers as (description, bounds)."""
     xml = d.dump_hierarchy(pretty=True)
@@ -639,7 +751,7 @@ def populate_invite_message(d, username: str, search_field) -> bool:
         message_field.clear_text()
         message_field.set_text(INVITE_MESSAGE_TEXT)
         log(f"  [{username}] Applied custom invite message.")
-        pause(0.6)
+        pause(1.0)
         return True
     except Exception as exc:
         log(f"  [{username}] Could not set custom invite message: {exc}")
@@ -647,35 +759,62 @@ def populate_invite_message(d, username: str, search_field) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# STEP 0: Reset to the Android home screen before starting Reddit
+# ─────────────────────────────────────────────────────────────────────────────
+
+def go_to_home_screen(d):
+    log("Returning to the Android home screen...")
+    try:
+        d.press("home")
+        pause(1.0)
+        d.press("home")
+        pause(1.0)
+    except Exception as exc:
+        log(f"Could not return to home screen cleanly: {exc}")
+
+
+def subreddit_deep_link(subreddit: str) -> str:
+    return f"https://www.reddit.com/r/{subreddit}/"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 1: Open r/dailyguess via deep link
 # ─────────────────────────────────────────────────────────────────────────────
 
 def open_subreddit(d, subreddit: str):
-    log(f"Opening r/{subreddit}...")
+    target_url = subreddit_deep_link(subreddit)
+    log(f"Opening r/{subreddit} sorted by {SOURCE_FEED_SORT}...")
     d.shell(
-        f'am start -a android.intent.action.VIEW '
-        f'-d "https://www.reddit.com/r/{subreddit}" '
+        f'am start -W -S -a android.intent.action.VIEW '
+        f'-d "{target_url}" '
         f'com.reddit.frontpage'
     )
-    pause(4)
+    pause(5)
     dismiss_nsfw_modal(d)
-    log("Subreddit opened.")
+    log(f"Subreddit opened via {target_url}.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2: Find first post with MIN_COMMENTS+ comments and open it
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_qualifying_post(d, deadline: float) -> bool:
-    log(f"Scanning feed for a post with {MIN_COMMENTS}+ comments...")
+def find_qualifying_post(d, deadline: float, skipped_post_keys: set[str]) -> tuple[bool, str | None]:
+    log(
+        f"Scanning feed for a post with {MIN_COMMENTS}+ comments "
+        f"(skipping {len(skipped_post_keys)} exhausted posts)..."
+    )
     _, screen_height = d.window_size()
 
     for scroll_num in range(MAX_FEED_SCROLLS):
         if timed_out(deadline):
-            return not log_timeout_and_stop()
+            return (not log_timeout_and_stop(), None)
         found_candidate = False
 
         for desc, bounds in visible_post_cards(d):
+            card_key = post_card_key(desc)
+            if card_key in skipped_post_keys:
+                continue
+
             count = parse_comment_count(desc)
             if count < MIN_COMMENTS:
                 continue
@@ -690,10 +829,11 @@ def find_qualifying_post(d, deadline: float) -> bool:
 
             log(f"  Found feed card with {count} comments — tapping post...")
             x, y = header_tap_point(bounds)
+            log(f"Candidate summary: {summarize_post_description(desc)}")
             safe_tap_point(d, x, y)
             pause(2.2)
             dismiss_nsfw_modal(d)
-            return True
+            return (True, card_key)
 
         if not found_candidate:
             # Fallback for older Reddit layouts that expose comment count as text.
@@ -713,7 +853,7 @@ def find_qualifying_post(d, deadline: float) -> bool:
                         safe_click(d, el)
                         pause(2.2)
                         dismiss_nsfw_modal(d)
-                        return True
+                        return (True, None)
                 except Exception:
                     continue
 
@@ -722,7 +862,7 @@ def find_qualifying_post(d, deadline: float) -> bool:
         pause(0.9)
 
     log("ERROR: No qualifying post found after maximum scrolls.")
-    return False
+    return (False, None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -891,7 +1031,7 @@ def invite_user(d, username: str) -> str:
     if not invite_btn.exists(timeout=2):
         log(f"  [{username}] Opening profile overflow via top-right coordinate.")
         safe_tap_relative(d, *COORDINATE_FALLBACKS["profile_more_actions"])
-        pause(1.2)
+        pause(1.5)
         invite_btn = d(textMatches=r"(?i)invite.*communit|communit.*invite|^invite$")
 
         if not invite_ui_visible():
@@ -905,7 +1045,7 @@ def invite_user(d, username: str) -> str:
             if overflow is not None:
                 log(f"  [{username}] Coordinate tap missed — retrying overflow by description.")
                 safe_click(d, overflow)
-                pause(0.9)
+                pause(1.2)
                 invite_btn = d(textMatches=r"(?i)invite.*communit|communit.*invite|^invite$")
 
     if not invite_btn.exists(timeout=3):
@@ -916,10 +1056,10 @@ def invite_user(d, username: str) -> str:
     if not invite_btn.exists(timeout=3):
         log(f"  [{username}] Invite button selector not found — using coordinate fallback.")
         safe_tap_relative(d, *COORDINATE_FALLBACKS["profile_invite_bottom_item"])
-        pause(1.0)
+        pause(1.5)
     else:
         safe_click(d, invite_btn)
-        pause(1.0)
+        pause(1.5)
 
     # If the coordinate fallback missed and we are still on the profile/menu, stop here.
     search_field = find_element(d, "search_field", className="android.widget.EditText")
@@ -931,7 +1071,7 @@ def invite_user(d, username: str) -> str:
     safe_click(d, search_field)
     search_field.clear_text()
     search_field.set_text(INVITE_MESSAGE_TEXT)
-    pause(2.0)  # wait for search results to populate
+    pause(2.6)  # wait for search results to populate
 
     # ── Tap the correct community result ─────────────────────────────────────
     community_result = d(textMatches=INVITE_COMMUNITY_PATTERN)
@@ -940,7 +1080,7 @@ def invite_user(d, username: str) -> str:
         return "not_found"
 
     safe_click(d, community_result)
-    pause(1.0)
+    pause(1.3)
     populate_invite_message(d, username, search_field)
 
     if DRY_RUN:
@@ -1108,7 +1248,7 @@ def attempt_comment_scroll(d, scale: float | None = None, use_direct_scroll: boo
     return after != before
 
 
-def run_invite_loop(d, deadline: float, visited_users: set[str]) -> tuple[str, int]:
+def run_invite_loop(d, deadline: float, visited_users: set[str], source_subreddit: str) -> tuple[str, int]:
     tap_miss_counts: dict[str, int] = {}
     low_viewport_deferred: set[str] = set()
     consecutive_errors: int = 0
@@ -1130,10 +1270,20 @@ def run_invite_loop(d, deadline: float, visited_users: set[str]) -> tuple[str, i
             for point, u in usernames
             if normalize_username(u) not in visited_users
         ]
+        visible_names = ", ".join(u for _, u in usernames[:5]) or "none"
+        log(
+            f"Comment scan pass {scroll_num + 1}/{MAX_COMMENT_SCROLLS + 1}: "
+            f"visible={len(usernames)}, unprocessed={len(new_users)}, "
+            f"stalled={stalled_scrolls}, consecutive_errors={consecutive_errors}, "
+            f"sample=[{visible_names}]"
+        )
 
         if not new_users:
             if scroll_num >= MAX_COMMENT_SCROLLS:
-                log("Reached maximum comment scrolls on this post. Returning to the feed.")
+                log(
+                    "Reached maximum comment scan passes on this post with no new invite targets. "
+                    "Returning to the feed."
+                )
                 return ("post_exhausted", total_invited)
             log(f"All visible users processed — scrolling for more comments ({scroll_num + 1}/{MAX_COMMENT_SCROLLS})...")
             if attempt_comment_scroll(d, scale=0.6):
@@ -1162,7 +1312,9 @@ def run_invite_loop(d, deadline: float, visited_users: set[str]) -> tuple[str, i
 
             if point[1] >= bottom_viewport_threshold:
                 if normalized in low_viewport_deferred:
-                    continue
+                    log(f"u/{username} is still too low on screen — scrolling for more comments.")
+                    should_scroll_for_more = True
+                    break
                 low_viewport_deferred.add(normalized)
                 log(f"u/{username} is too low on screen to tap reliably — scrolling for more comments.")
                 should_scroll_for_more = True
@@ -1202,15 +1354,20 @@ def run_invite_loop(d, deadline: float, visited_users: set[str]) -> tuple[str, i
             if result == "success":
                 visited_users.add(normalized)
                 record_invited_user(username)
+                update_daily_tally(processed_delta=1, successful_delta=1)
                 total_invited += 1
                 consecutive_errors = 0
                 log(f"  Invited. Total this session: {total_invited}")
+                write_status_file("running", total_invited, source_subreddit)
 
             elif result == "error":
                 visited_users.add(normalized)
+                record_invited_user(username)
+                update_daily_tally(processed_delta=1)
                 consecutive_errors += 1
-                log(f"  Marking u/{username} as handled for this session after error.")
+                log(f"  Marking u/{username} as handled and recording to invited list after error.")
                 log(f"  Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
+                write_status_file("running", total_invited, source_subreddit)
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     log(
                         f"Reached {MAX_CONSECUTIVE_ERRORS} consecutive errors — "
@@ -1220,6 +1377,8 @@ def run_invite_loop(d, deadline: float, visited_users: set[str]) -> tuple[str, i
                     return ("rate_limited", total_invited)
 
             # 'not_found' does not count toward the error limit
+            else:
+                update_daily_tally(processed_delta=1)
 
         if should_scroll_for_more:
             if attempt_comment_scroll(d, use_direct_scroll=True):
@@ -1235,7 +1394,10 @@ def run_invite_loop(d, deadline: float, visited_users: set[str]) -> tuple[str, i
                     return ("post_exhausted", total_invited)
             continue
 
-    log(f"Invite loop complete. Total invited on this post: {total_invited}")
+    log(
+        f"Invite loop ended after {MAX_COMMENT_SCROLLS + 1} comment scan passes. "
+        f"Total invited on this post: {total_invited}"
+    )
     return ("completed", total_invited)
 
 
@@ -1247,7 +1409,12 @@ def main():
     deadline = time.monotonic() + MAX_RUNTIME_SECONDS
     source_subreddit = random.choice(SOURCE_SUBREDDITS)
     visited_users = load_invited_users()
+    exhausted_post_keys: set[str] = set()
     total_invited = 0
+    final_state = "completed"
+
+    ensure_daily_tally_entry()
+    write_status_file("starting", total_invited, source_subreddit)
 
     if DRY_RUN:
         log("=" * 60)
@@ -1288,32 +1455,55 @@ def main():
     d.screen_on()
 
     try:
+        go_to_home_screen(d)
         open_subreddit(d, source_subreddit)
+        write_status_file("running", total_invited, source_subreddit)
 
         while not timed_out(deadline):
-            if not find_qualifying_post(d, deadline):
+            found_post, active_post_key = find_qualifying_post(d, deadline, exhausted_post_keys)
+            if not found_post:
                 if timed_out(deadline):
+                    final_state = "timed_out"
+                    write_status_file("timed_out", total_invited, source_subreddit)
                     log("Script complete.")
                     return
                 log("Could not find a qualifying post. Exiting.")
+                final_state = "no_post_found"
+                write_status_file("no_post_found", total_invited, source_subreddit)
                 sys.exit(1)
 
             if timed_out(deadline):
                 log_timeout_and_stop()
+                final_state = "timed_out"
+                write_status_file("timed_out", total_invited, source_subreddit)
                 log("Script complete.")
                 return
 
             filter_by_new(d)
-            result, invited_count = run_invite_loop(d, deadline, visited_users)
+            result, invited_count = run_invite_loop(d, deadline, visited_users, source_subreddit)
             total_invited += invited_count
+            write_status_file(result, total_invited, source_subreddit)
+            log(
+                f"Post processing finished with result='{result}' and invited_count={invited_count}. "
+                f"Session total is now {total_invited}."
+            )
 
             if result == "timed_out":
+                final_state = "timed_out"
+                log("Stopping run because the hard runtime limit was reached during comment processing.")
                 break
             if result == "rate_limited":
+                final_state = "rate_limited"
+                log("Stopping run because the consecutive error threshold suggests a rate limit or repeated invite failures.")
                 break
             if result == "completed":
+                final_state = "completed"
+                log("Stopping run because the comment scan loop completed for the selected post.")
                 break
             if result == "post_exhausted":
+                if active_post_key:
+                    exhausted_post_keys.add(active_post_key)
+                    log("Marking current post as exhausted so it will be skipped on the feed.")
                 if timed_out(deadline):
                     break
                 navigate_back_to_feed(d)
@@ -1322,7 +1512,11 @@ def main():
                 continue
 
         log(f"Session invite total: {total_invited}")
+        log(f"Final run state: {final_state}")
+        write_status_file(final_state, total_invited, source_subreddit)
     except InputInjectionBlocked:
+        final_state = "input_blocked"
+        write_status_file("input_blocked", total_invited, source_subreddit)
         log("The phone is blocking simulated taps/swipes from ADB and UIAutomator.")
         log("On POCO/Xiaomi devices, enable Developer options > USB debugging (Security settings).")
         log("If that option exists, also enable Install via USB, then reconnect the cable and accept prompts.")
