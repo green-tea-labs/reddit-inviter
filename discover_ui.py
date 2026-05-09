@@ -1,7 +1,7 @@
 """
 UI Hierarchy Discovery Tool
 ===========================
-Run this script ONCE before using reddit_inviter.py to capture the Reddit app's
+Run this script ONCE before using daily_inviter/reddit_inviter.py to capture the Reddit app's
 UI element structure at each key screen. This generates XML files you search to
 find the exact resource-id values for your installed version of the Reddit app.
 
@@ -18,7 +18,7 @@ After running, open each XML file in a text editor (or VS Code) and search for:
     "sort"     -> find the sort/filter button resource-id
     "new"      -> find the "New" sort option resource-id
 
-Copy the relevant resource-id values into the CONFIG dict in reddit_inviter.py
+Copy the relevant resource-id values into the CONFIG dict in daily_inviter/reddit_inviter.py
 """
 
 import os
@@ -91,7 +91,7 @@ def main():
     print("  'sort'     -> sort/filter button element")
     print("  'new'      -> 'New' sort option element")
     print()
-    print("Update the CONFIG dict in reddit_inviter.py with any resource-id values you find.")
+    print("Update the CONFIG dict in daily_inviter/reddit_inviter.py with any resource-id values you find.")
     print("If resource-ids are absent or unstable, text-based selectors (already in the script)")
     print("will be used as the default — no changes needed.")
 

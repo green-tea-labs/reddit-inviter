@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import time
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent
-STATUS_FILE = BASE_DIR / "invite_status.json"
+TALLY_FILE = BASE_DIR / "daily_invite_tally.txt"
 HOST = "0.0.0.0"
 PORT = 8765
 
@@ -24,29 +26,75 @@ def local_lan_ip() -> str:
         return "127.0.0.1"
 
 
-def read_status() -> dict:
-    if not STATUS_FILE.exists():
-        return {
-            "updated_at": "",
-            "state": "waiting",
-            "today_successful": 0,
-            "total_invited": 0,
-            "session_successful": 0,
-            "source_subreddit": "",
-            "lan_hint": local_lan_ip(),
-        }
+def read_daily_tallies() -> dict[str, tuple[int, int]]:
+    tallies: dict[str, tuple[int, int]] = {}
+
+    if not TALLY_FILE.exists():
+        return tallies
+
     try:
-        return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+        for raw_line in TALLY_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            match = re.fullmatch(
+                r"(\d{4}-\d{2}-\d{2})\s+processed=(\d+)\s+successful=(\d+)",
+                line,
+            )
+            if not match:
+                continue
+
+            tally_date, processed_count, successful_count = match.groups()
+            existing_processed, existing_successful = tallies.get(tally_date, (0, 0))
+            tallies[tally_date] = (
+                existing_processed + int(processed_count),
+                existing_successful + int(successful_count),
+            )
     except Exception as exc:
+        raise RuntimeError(f"tally-read-error: {exc}") from exc
+
+    return tallies
+
+
+def read_status() -> dict:
+    try:
+        tallies = read_daily_tallies()
+    except RuntimeError as exc:
         return {
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "state": f"status-read-error: {exc}",
+            "state": str(exc),
+            "today_processed": 0,
             "today_successful": 0,
-            "total_invited": 0,
-            "session_successful": 0,
-            "source_subreddit": "",
+            "daily_totals": [],
             "lan_hint": local_lan_ip(),
         }
+
+    today = date.today().isoformat()
+    today_processed, today_successful = tallies.get(today, (0, 0))
+    total_processed = sum(processed_count for processed_count, _ in tallies.values())
+    total_successful = sum(successful_count for _, successful_count in tallies.values())
+    updated_at = ""
+    if TALLY_FILE.exists():
+        updated_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(TALLY_FILE.stat().st_mtime))
+
+    return {
+        "updated_at": updated_at,
+        "state": "ready" if tallies else "waiting",
+        "today_processed": today_processed,
+        "today_successful": today_successful,
+        "total_processed": total_processed,
+        "total_successful": total_successful,
+        "daily_totals": [
+            {
+                "date": tally_date,
+                "processed": processed_count,
+                "successful": successful_count,
+            }
+            for tally_date, (processed_count, successful_count) in sorted(tallies.items())
+        ],
+        "lan_hint": local_lan_ip(),
+    }
 
 
 class StatusHandler(BaseHTTPRequestHandler):
@@ -80,16 +128,17 @@ class StatusHandler(BaseHTTPRequestHandler):
 </head>
 <body>
   <div class=\"card\">
-    <h1>Reddit Inviter Status</h1>
+        <h1>reddit-android-bot Status</h1>
     <div class=\"grid\">
-      <div class=\"panel\"><div class=\"label\">Today's Successful Invites</div><div class=\"stat\">{payload.get('today_successful', 0)}</div></div>
-      <div class=\"panel\"><div class=\"label\">Total Invited</div><div class=\"stat\">{payload.get('total_invited', 0)}</div></div>
-      <div class=\"panel\"><div class=\"label\">This Session</div><div class=\"stat\">{payload.get('session_successful', 0)}</div></div>
+                        <div class="panel"><div class="label">Today's Processed</div><div class="stat">{payload.get('today_processed', 0)}</div></div>
+                        <div class="panel"><div class="label">Today's Successful</div><div class="stat">{payload.get('today_successful', 0)}</div></div>
+                        <div class="panel"><div class="label">Total Processed</div><div class="stat">{payload.get('total_processed', 0)}</div></div>
+                        <div class="panel"><div class="label">Total Successful</div><div class="stat">{payload.get('total_successful', 0)}</div></div>
     </div>
     <p><strong>State:</strong> {payload.get('state', '')}</p>
-    <p><strong>Source subreddit:</strong> {payload.get('source_subreddit', '') or 'n/a'}</p>
     <p><strong>Updated:</strong> {payload.get('updated_at', '') or 'n/a'}</p>
     <p><strong>JSON endpoint:</strong> <code>/status.json</code></p>
+                <pre>{json.dumps(payload.get('daily_totals', []), indent=2)}</pre>
   </div>
 </body>
 </html>

@@ -1,6 +1,6 @@
 """
-Reddit Auto-Inviter
-===================
+reddit-android-bot
+==================
 Automates inviting commenters from r/dailyguess to r/PineappleCactus using
 the Reddit Android app running on a USB-connected Android phone.
 
@@ -28,23 +28,21 @@ PREREQUISITE SETUP (one-time)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USAGE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    python reddit_inviter.py
+    python daily_inviter/reddit_inviter.py
 
 Set DRY_RUN = True below to test navigation without confirming any invites.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TUNING SELECTORS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Run discover_ui.py first to dump the UI hierarchy at each key screen.
+Run discover_ui.py from the repo root first to dump the UI hierarchy at each key screen.
 Search the resulting XML files for "resource-id" values and paste them
 into the RESOURCE_IDS section below for faster, more reliable matching.
 If left as empty strings (""), the script falls back to text-based selectors.
 """
 
-import json
 import random
 import re
-import socket
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -53,6 +51,13 @@ from pathlib import Path
 
 import adbutils
 import uiautomator2 as u2
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+
+import reddit_account_switcher
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION — edit this section
@@ -79,9 +84,12 @@ INVITE_COMMUNITY = "pineapple cactus"
 # Invite community display name to match in search results (regex, case-insensitive)
 INVITE_COMMUNITY_PATTERN = r"(?i)pineapple.?cactus"
 
+# Account that should be active before invite automation starts.
+TARGET_REDDIT_ACCOUNT = "u/Lazynick91"
+
 # Text typed into the invite field. On the current Reddit UI this becomes the
 # message sent to the user, so change this if you want a different invite note.
-INVITE_MESSAGE_TEXT = "Hey! Just a friendly invite from a quiz sub/community. Saw you liked similar subs, no worries if it’s not your thing."
+INVITE_MESSAGE_TEXT = ""
 
 # A post must have at least this many comments to qualify
 MIN_COMMENTS = 10
@@ -119,7 +127,6 @@ SWIPE_X_JITTER_PX = 28
 
 # File that stores usernames already invited across previous runs.
 INVITED_USERS_FILE = Path(__file__).with_name("invited_users.txt")
-INVITE_STATUS_FILE = Path(__file__).with_name("invite_status.json")
 DAILY_TALLY_FILE = Path(__file__).with_name("daily_invite_tally.txt")
 
 # ── Optional: paste resource-id values found via discover_ui.py ──────────────
@@ -219,21 +226,6 @@ def count_total_invited_users() -> int:
     return len(load_invited_users())
 
 
-def count_today_successes() -> int:
-    today = datetime.now().date().isoformat()
-    _, successful_count = _read_daily_tallies().get(today, (0, 0))
-    return successful_count
-
-
-def local_lan_ip() -> str:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(("8.8.8.8", 80))
-            return sock.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-
-
 def _read_daily_tallies() -> dict[str, tuple[int, int]]:
     tallies: dict[str, tuple[int, int]] = {}
 
@@ -254,7 +246,11 @@ def _read_daily_tallies() -> dict[str, tuple[int, int]]:
                 continue
 
             tally_date, processed_count, successful_count = match.groups()
-            tallies[tally_date] = (int(processed_count), int(successful_count))
+            existing_processed, existing_successful = tallies.get(tally_date, (0, 0))
+            tallies[tally_date] = (
+                existing_processed + int(processed_count),
+                existing_successful + int(successful_count),
+            )
     except Exception as exc:
         log(f"WARNING: Could not read daily tally file: {exc}")
 
@@ -268,44 +264,23 @@ def _write_daily_tallies(tallies: dict[str, tuple[int, int]]):
     ]
 
     try:
-        DAILY_TALLY_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        DAILY_TALLY_FILE.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     except Exception as exc:
         log(f"WARNING: Could not write daily tally file: {exc}")
 
 
-def ensure_daily_tally_entry():
-    today = datetime.now().date().isoformat()
-    tallies = _read_daily_tallies()
-    if today not in tallies:
-        tallies[today] = (0, 0)
-        _write_daily_tallies(tallies)
-
-
 def update_daily_tally(processed_delta: int = 0, successful_delta: int = 0):
+    if processed_delta == 0 and successful_delta == 0:
+        return
+
     today = datetime.now().date().isoformat()
+    processed_count, successful_count = _read_daily_tallies().get(today, (0, 0))
     tallies = _read_daily_tallies()
-    processed_count, successful_count = tallies.get(today, (0, 0))
     tallies[today] = (
         processed_count + processed_delta,
         successful_count + successful_delta,
     )
     _write_daily_tallies(tallies)
-
-
-def write_status_file(state: str, session_successes: int = 0, source_subreddit: str = ""):
-    payload = {
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
-        "state": state,
-        "today_successful": count_today_successes(),
-        "total_invited": count_total_invited_users(),
-        "session_successful": session_successes,
-        "source_subreddit": source_subreddit,
-        "lan_hint": local_lan_ip(),
-    }
-    try:
-        INVITE_STATUS_FILE.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    except Exception as exc:
-        log(f"WARNING: Could not write status file: {exc}")
 
 
 def timed_out(deadline: float) -> bool:
@@ -321,6 +296,58 @@ def go_back(d, times: int = 1):
     for _ in range(times):
         d.press("back")
         pause(0.5)
+
+
+def current_package_name(d) -> str:
+    try:
+        info = d.app_current()
+    except Exception:
+        return ""
+
+    if isinstance(info, dict):
+        return str(info.get("package") or "")
+    return ""
+
+
+def reddit_in_foreground(d) -> bool:
+    return current_package_name(d) == "com.reddit.frontpage"
+
+
+def close_reddit_app(d):
+    log("Closing Reddit app...")
+    try:
+        d.app_stop("com.reddit.frontpage")
+    except Exception:
+        try:
+            d.shell("am force-stop com.reddit.frontpage")
+        except Exception as exc:
+            log(f"WARNING: Could not close Reddit app: {exc}")
+            return
+    pause(0.5)
+
+
+def recover_reddit_to_feed(d, subreddit: str):
+    log("Reddit is no longer in the foreground. Reopening the subreddit feed.")
+    open_subreddit(d, subreddit)
+    pause(1.0)
+
+
+def ensure_reddit_feed_context(d, source_subreddit: str) -> bool:
+    """Make sure Reddit is foregrounded and the subreddit feed is visible."""
+    if not reddit_in_foreground(d):
+        recover_reddit_to_feed(d, source_subreddit)
+        return True
+
+    screen = current_screen(d)
+    if screen == "feed":
+        return True
+
+    log(f"Feed scan expected the subreddit feed, but screen='{screen}'. Recovering feed context.")
+    if navigate_back_to_feed(d, source_subreddit=source_subreddit):
+        return True
+
+    recover_reddit_to_feed(d, source_subreddit)
+    return True
 
 
 def toast_visible(d, text: str, timeout: float = 3.0) -> bool:
@@ -794,11 +821,21 @@ def open_subreddit(d, subreddit: str):
     log(f"Subreddit opened via {target_url}.")
 
 
+def ensure_target_account(d):
+    reddit_account_switcher.switch_reddit_account(
+        d,
+        TARGET_REDDIT_ACCOUNT,
+        log,
+        pause,
+        safe_click,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2: Find first post with MIN_COMMENTS+ comments and open it
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_qualifying_post(d, deadline: float, skipped_post_keys: set[str]) -> tuple[bool, str | None]:
+def find_qualifying_post(d, deadline: float, skipped_post_keys: set[str], source_subreddit: str) -> tuple[bool, str | None]:
     log(
         f"Scanning feed for a post with {MIN_COMMENTS}+ comments "
         f"(skipping {len(skipped_post_keys)} exhausted posts)..."
@@ -808,6 +845,8 @@ def find_qualifying_post(d, deadline: float, skipped_post_keys: set[str]) -> tup
     for scroll_num in range(MAX_FEED_SCROLLS):
         if timed_out(deadline):
             return (not log_timeout_and_stop(), None)
+
+        ensure_reddit_feed_context(d, source_subreddit)
         found_candidate = False
 
         for desc, bounds in visible_post_cards(d):
@@ -1184,8 +1223,10 @@ def current_screen(d) -> str:
         return "unknown"
 
     resource_ids = {node.attrib.get("resource-id", "") for node in root.iter("node")}
+    texts        = [node.attrib.get("text", "") for node in root.iter("node")]
     descs        = [node.attrib.get("content-desc", "") for node in root.iter("node")]
     classes      = [node.attrib.get("class", "") for node in root.iter("node")]
+    labels       = [value.lower() for value in texts + descs if value]
 
     if "action_sort" in resource_ids:
         return "comments"
@@ -1196,7 +1237,7 @@ def current_screen(d) -> str:
         for d in descs
     ):
         return "invite"
-    if any(d.lower() in ("karma", "followers", "follow", "message") for d in descs):
+    if any(label in ("karma", "followers", "following", "follow", "message", "chat", "posts", "about") for label in labels):
         return "profile"
     # feed posts have many comment-count descriptions
     comment_count_nodes = [
@@ -1208,9 +1249,14 @@ def current_screen(d) -> str:
     return "unknown"
 
 
-def navigate_back_to_comments(d, max_backs: int = 8):
+def navigate_back_to_comments(d, max_backs: int = 8, source_subreddit: str = ""):
     """Press back until the comment list is visible, logging each step."""
     for i in range(max_backs):
+        if not reddit_in_foreground(d):
+            log(f"  [nav] Reddit lost focus while returning to comments (step {i}).")
+            if source_subreddit:
+                recover_reddit_to_feed(d, source_subreddit)
+            return False
         screen = current_screen(d)
         log(f"  [nav] screen={screen} (step {i})")
         if screen == "comments":
@@ -1221,9 +1267,15 @@ def navigate_back_to_comments(d, max_backs: int = 8):
     return False
 
 
-def navigate_back_to_feed(d, max_backs: int = 10):
+def navigate_back_to_feed(d, max_backs: int = 10, source_subreddit: str = ""):
     """Press back until the subreddit feed is visible, logging each step."""
     for i in range(max_backs):
+        if not reddit_in_foreground(d):
+            log(f"  [nav] Reddit lost focus while returning to feed (step {i}).")
+            if source_subreddit:
+                recover_reddit_to_feed(d, source_subreddit)
+                return True
+            return False
         screen = current_screen(d)
         log(f"  [nav] screen={screen} while returning to feed (step {i})")
         if screen == "feed":
@@ -1348,7 +1400,7 @@ def run_invite_loop(d, deadline: float, visited_users: set[str], source_subreddi
             # Navigate back to the comment list regardless of how many
             # screens the invite flow opened (Reddit sometimes auto-dismisses
             # the picker, leaving us already at the profile).
-            navigate_back_to_comments(d)
+            navigate_back_to_comments(d, source_subreddit=source_subreddit)
             pause(0.6)
 
             if result == "success":
@@ -1358,7 +1410,6 @@ def run_invite_loop(d, deadline: float, visited_users: set[str], source_subreddi
                 total_invited += 1
                 consecutive_errors = 0
                 log(f"  Invited. Total this session: {total_invited}")
-                write_status_file("running", total_invited, source_subreddit)
 
             elif result == "error":
                 visited_users.add(normalized)
@@ -1367,7 +1418,6 @@ def run_invite_loop(d, deadline: float, visited_users: set[str], source_subreddi
                 consecutive_errors += 1
                 log(f"  Marking u/{username} as handled and recording to invited list after error.")
                 log(f"  Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
-                write_status_file("running", total_invited, source_subreddit)
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     log(
                         f"Reached {MAX_CONSECUTIVE_ERRORS} consecutive errors — "
@@ -1411,10 +1461,8 @@ def main():
     visited_users = load_invited_users()
     exhausted_post_keys: set[str] = set()
     total_invited = 0
-    final_state = "completed"
-
-    ensure_daily_tally_entry()
-    write_status_file("starting", total_invited, source_subreddit)
+    final_state = "started"
+    d = None
 
     if DRY_RUN:
         log("=" * 60)
@@ -1456,33 +1504,29 @@ def main():
 
     try:
         go_to_home_screen(d)
+        ensure_target_account(d)
         open_subreddit(d, source_subreddit)
-        write_status_file("running", total_invited, source_subreddit)
 
         while not timed_out(deadline):
-            found_post, active_post_key = find_qualifying_post(d, deadline, exhausted_post_keys)
+            found_post, active_post_key = find_qualifying_post(d, deadline, exhausted_post_keys, source_subreddit)
             if not found_post:
                 if timed_out(deadline):
                     final_state = "timed_out"
-                    write_status_file("timed_out", total_invited, source_subreddit)
                     log("Script complete.")
                     return
                 log("Could not find a qualifying post. Exiting.")
                 final_state = "no_post_found"
-                write_status_file("no_post_found", total_invited, source_subreddit)
                 sys.exit(1)
 
             if timed_out(deadline):
                 log_timeout_and_stop()
                 final_state = "timed_out"
-                write_status_file("timed_out", total_invited, source_subreddit)
                 log("Script complete.")
                 return
 
             filter_by_new(d)
             result, invited_count = run_invite_loop(d, deadline, visited_users, source_subreddit)
             total_invited += invited_count
-            write_status_file(result, total_invited, source_subreddit)
             log(
                 f"Post processing finished with result='{result}' and invited_count={invited_count}. "
                 f"Session total is now {total_invited}."
@@ -1496,31 +1540,37 @@ def main():
                 final_state = "rate_limited"
                 log("Stopping run because the consecutive error threshold suggests a rate limit or repeated invite failures.")
                 break
-            if result == "completed":
-                final_state = "completed"
-                log("Stopping run because the comment scan loop completed for the selected post.")
-                break
-            if result == "post_exhausted":
+            if result in {"completed", "post_exhausted"}:
                 if active_post_key:
                     exhausted_post_keys.add(active_post_key)
-                    log("Marking current post as exhausted so it will be skipped on the feed.")
+                    if result == "completed":
+                        log("Marking completed post so it will be skipped on the feed.")
+                    else:
+                        log("Marking current post as exhausted so it will be skipped on the feed.")
                 if timed_out(deadline):
                     break
-                navigate_back_to_feed(d)
+                navigate_back_to_feed(d, source_subreddit=source_subreddit)
                 pause(1.5)
-                log("Post exhausted. Looking for another post with enough comments...")
+                if result == "completed":
+                    log("Post completed. Looking for another post with enough comments...")
+                else:
+                    log("Post exhausted. Looking for another post with enough comments...")
                 continue
 
         log(f"Session invite total: {total_invited}")
         log(f"Final run state: {final_state}")
-        write_status_file(final_state, total_invited, source_subreddit)
     except InputInjectionBlocked:
         final_state = "input_blocked"
-        write_status_file("input_blocked", total_invited, source_subreddit)
         log("The phone is blocking simulated taps/swipes from ADB and UIAutomator.")
         log("On POCO/Xiaomi devices, enable Developer options > USB debugging (Security settings).")
         log("If that option exists, also enable Install via USB, then reconnect the cable and accept prompts.")
         sys.exit(1)
+    except Exception:
+        final_state = "crashed"
+        raise
+    finally:
+        if d is not None:
+            close_reddit_app(d)
 
     log("Script complete.")
 
