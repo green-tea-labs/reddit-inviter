@@ -1,0 +1,20 @@
+{
+  "posts": [
+    {
+      "date": "2026-05-23",
+      "submitted_at": "2026-05-23T12:47:33",
+      "status": "dry_run",
+      "title": "Give today’s daily challenges a try 🔥 (23/05)",
+      "url": "https://www.pineapplecactus.com/daily-challenges",
+      "details": "Daily challenge form populated without submitting."
+    },
+    {
+      "date": "2026-05-23",
+      "submitted_at": "2026-05-23T12:54:32",
+      "status": "dry_run",
+      "title": "Give today’s daily challenges a try 🔥 (23/05)",
+      "url": "https://www.pineapplecactus.com/daily-challenges",
+      "details": "Daily challenge form populated without submitting."
+    }
+  ]
+}

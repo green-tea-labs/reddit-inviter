@@ -47,6 +47,14 @@
       "title": "Give today’s puzzles a shot 🧠🔥 (09/05)",
       "url": "https://www.pineapplecactus.com/puzzles",
       "details": "Form populated without submitting."
+    },
+    {
+      "date": "2026-05-23",
+      "submitted_at": "2026-05-23T12:48:31",
+      "status": "dry_run",
+      "title": "Test your brain with today’s puzzles 🧠 (23/05)",
+      "url": "https://www.pineapplecactus.com/puzzles",
+      "details": "Form populated without submitting."
     }
   ]
 }

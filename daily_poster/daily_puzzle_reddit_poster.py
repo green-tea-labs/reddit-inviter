@@ -40,7 +40,7 @@ DRY_RUN = False
 
 TARGET_SUBREDDIT = "pineapplecactus"
 TARGET_URL = "https://www.pineapplecactus.com/puzzles"
-TARGET_FLAIR = "Puzzle"
+TARGET_FLAIR = "🧩Puzzle"
 TARGET_REDDIT_ACCOUNT = "u/PineappleCactusQuiz"
 MAX_RUNTIME_SECONDS = 10 * 60
 
@@ -372,28 +372,28 @@ def collect_edit_fields(d):
     return fields
 
 
-def best_matching_field(fields, resource_id: str, keywords: tuple[str, ...], exclude_ids: set[int]) -> object | None:
+def best_matching_field(fields, resource_id: str, keywords: tuple[str, ...], exclude_centers: set[tuple[int, int]]) -> object | None:
     if resource_id:
         for item in fields:
-            if id(item["field"]) in exclude_ids:
+            if item["center"] in exclude_centers:
                 continue
             if resource_id in item["haystack"]:
                 return item["field"]
 
     for item in fields:
-        if id(item["field"]) in exclude_ids:
+        if item["center"] in exclude_centers:
             continue
         if all(keyword in item["haystack"] for keyword in keywords):
             return item["field"]
 
     for item in fields:
-        if id(item["field"]) in exclude_ids:
+        if item["center"] in exclude_centers:
             continue
         if any(keyword in item["haystack"] for keyword in keywords):
             return item["field"]
 
     for item in fields:
-        if id(item["field"]) not in exclude_ids:
+        if item["center"] not in exclude_centers:
             return item["field"]
 
     return None
@@ -411,6 +411,25 @@ def reveal_optional_body_field(d):
             pause(1.0)
             return True
     return False
+
+
+def tap_bottom_left_link_button(d) -> bool:
+    try:
+        width, height = d.window_size()
+    except Exception:
+        return False
+
+    tap_x = max(1, int(width * 0.08))
+    tap_y = max(1, int(height * 0.84))
+
+    try:
+        run_shell_input(d, f"input tap {tap_x} {tap_y}")
+    except Exception:
+        return False
+
+    log("Tapped the bottom-left chain icon to switch into link mode.")
+    pause(1.0)
+    return True
 
 
 def ensure_link_post_mode(d):
@@ -435,7 +454,7 @@ def ensure_link_post_mode(d):
             pause(1.0)
             return True
 
-    return False
+    return tap_bottom_left_link_button(d)
 
 
 def open_flair_picker(d) -> bool:
@@ -530,15 +549,62 @@ def ensure_post_flair(d, flair_name: str) -> bool:
     return False
 
 
-def open_submit_screen(d):
-    target_url = f"https://www.reddit.com/r/{TARGET_SUBREDDIT}/submit"
-    log(f"Opening submit screen for r/{TARGET_SUBREDDIT}...")
+def open_subreddit_feed(d):
+    target_url = f"https://www.reddit.com/r/{TARGET_SUBREDDIT}/"
+    log(f"Opening subreddit feed for r/{TARGET_SUBREDDIT}...")
     d.shell(
         f'am start -W -S -a android.intent.action.VIEW '
         f'-d "{target_url}" '
         f'com.reddit.frontpage'
     )
     pause(5.0)
+
+
+def tap_bottom_center_create_post_button(d) -> bool:
+    try:
+        width, height = d.window_size()
+    except Exception:
+        return False
+
+    tap_x = max(1, int(width * 0.5))
+    tap_y = max(1, int(height * 0.92))
+
+    try:
+        run_shell_input(d, f"input tap {tap_x} {tap_y}")
+    except Exception:
+        return False
+
+    log("Tapped the bottom-center create post button fallback.")
+    pause(2.0)
+    return True
+
+
+def tap_create_post_button(d) -> bool:
+    selectors = (
+        d(textMatches=r"(?i)^create post$"),
+        d(textMatches=r"(?i)^create$"),
+        d(textContains="Create post"),
+        d(textContains="Create"),
+        d(descriptionMatches=r"(?i).*create post.*"),
+        d(descriptionMatches=r"(?i)^create$"),
+    )
+
+    for selector in selectors:
+        if selector.exists(timeout=0.8):
+            log("Opening the subreddit composer via the Create post button.")
+            safe_click(d, selector)
+            pause(2.0)
+            return True
+
+    return tap_bottom_center_create_post_button(d)
+
+
+def open_submit_screen(d):
+    open_subreddit_feed(d)
+    if tap_create_post_button(d):
+        return
+
+    raise RuntimeError("Could not open the subreddit composer from the subreddit feed.")
 
 
 def ensure_target_account(d):
@@ -562,7 +628,7 @@ def populate_post_form(d, post_payload: dict[str, str]):
             "Run the script while the phone is unlocked and the app is up to date."
         )
 
-    used_fields: set[int] = set()
+    used_fields: set[tuple[int, int]] = set()
 
     title_field = best_matching_field(
         fields,
@@ -572,7 +638,7 @@ def populate_post_form(d, post_payload: dict[str, str]):
     )
     if title_field is None:
         raise RuntimeError("Could not identify the title field.")
-    used_fields.add(id(title_field))
+    used_fields.add(element_center(title_field))
     fill_text_field(d, title_field, post_payload["title"], "title")
 
     url_field = best_matching_field(
@@ -585,7 +651,7 @@ def populate_post_form(d, post_payload: dict[str, str]):
         url_field = best_matching_field(fields, "", ("http",), used_fields)
     if url_field is None:
         raise RuntimeError("Could not identify the URL field required for a link post.")
-    used_fields.add(id(url_field))
+    used_fields.add(element_center(url_field))
     fill_text_field(d, url_field, post_payload["url"], "URL")
 
     reveal_optional_body_field(d)
