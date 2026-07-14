@@ -33,7 +33,11 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
+from console_output import configure_utf8_output
 import reddit_account_switcher
+
+
+configure_utf8_output()
 
 
 DRY_RUN = False
@@ -372,7 +376,13 @@ def collect_edit_fields(d):
     return fields
 
 
-def best_matching_field(fields, resource_id: str, keywords: tuple[str, ...], exclude_centers: set[tuple[int, int]]) -> object | None:
+def best_matching_field(
+    fields,
+    resource_id: str,
+    keywords: tuple[str, ...],
+    exclude_centers: set[tuple[int, int]],
+    allow_fallback: bool = True,
+) -> object | None:
     if resource_id:
         for item in fields:
             if item["center"] in exclude_centers:
@@ -392,9 +402,10 @@ def best_matching_field(fields, resource_id: str, keywords: tuple[str, ...], exc
         if any(keyword in item["haystack"] for keyword in keywords):
             return item["field"]
 
-    for item in fields:
-        if item["center"] not in exclude_centers:
-            return item["field"]
+    if allow_fallback:
+        for item in fields:
+            if item["center"] not in exclude_centers:
+                return item["field"]
 
     return None
 
@@ -659,11 +670,10 @@ def populate_post_form(d, post_payload: dict[str, str]):
     body_field = best_matching_field(
         fields,
         RESOURCE_IDS["body_field"],
-        ("body",),
+        ("body", "optional", "details"),
         used_fields,
+        allow_fallback=False,
     )
-    if body_field is None:
-        body_field = best_matching_field(fields, "", ("optional",), used_fields)
 
     if body_field is not None:
         fill_text_field(d, body_field, post_payload["body"], "body")

@@ -10,6 +10,11 @@ from pathlib import Path
 import adbutils
 import uiautomator2 as u2
 
+from console_output import configure_utf8_output
+
+
+configure_utf8_output()
+
 BASE_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = BASE_DIR.parent
 if str(WORKSPACE_ROOT) not in sys.path:

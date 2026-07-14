@@ -5,11 +5,21 @@ from __future__ import annotations
 import json
 import re
 import socket
+import sys
 import time
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+
+from console_output import configure_utf8_output
+
+
+configure_utf8_output()
 
 BASE_DIR = Path(__file__).resolve().parent
 TALLY_FILE = BASE_DIR / "daily_invite_tally.txt"

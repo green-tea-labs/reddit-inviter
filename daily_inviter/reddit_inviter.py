@@ -57,7 +57,11 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
+from console_output import configure_utf8_output
 import reddit_account_switcher
+
+
+configure_utf8_output()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION — edit this section

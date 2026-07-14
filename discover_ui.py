@@ -25,6 +25,11 @@ import os
 import time
 import uiautomator2 as u2
 
+from console_output import configure_utf8_output
+
+
+configure_utf8_output()
+
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
