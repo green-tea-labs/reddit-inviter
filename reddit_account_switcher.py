@@ -98,13 +98,30 @@ def open_profile_tab(d, log, pause, safe_click) -> bool:
     return False
 
 
+def account_switcher_sheet_visible(d) -> bool:
+    if d(textMatches=r"(?i)^accounts$").exists(timeout=0.2):
+        return True
+
+    if d(textMatches=r"(?i)^anonymous browsing$").exists(timeout=0.2):
+        return True
+
+    if d(textMatches=r"(?i)^add account$").exists(timeout=0.2):
+        return True
+
+    for text in visible_texts(d):
+        if text.lower().startswith("u/"):
+            return True
+
+    return False
+
+
 def open_account_switcher(d, log, pause, safe_click) -> bool:
     button = d(resourceId="account_switcher_button")
     if button.exists(timeout=0.8):
         log("Opening the account switcher.")
         safe_click(d, button)
         pause(ACCOUNT_SWITCHER_DELAY_SECONDS)
-        return d(resourceId="com.reddit.frontpage:id/account_picker_accounts").exists(timeout=1.0)
+        return account_switcher_sheet_visible(d)
     return False
 
 
