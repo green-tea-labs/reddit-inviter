@@ -30,7 +30,10 @@ USAGE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     python daily_inviter/reddit_inviter.py
 
-Set DRY_RUN = True below to test navigation without confirming any invites.
+    python daily_inviter/reddit_inviter.py --dry-run
+
+Dry-run mode navigates the invite flow without confirming invites or changing
+the invited-user list and daily tally.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TUNING SELECTORS
@@ -41,6 +44,7 @@ into the RESOURCE_IDS section below for faster, more reliable matching.
 If left as empty strings (""), the script falls back to text-based selectors.
 """
 
+import argparse
 import random
 import re
 import sys
@@ -49,15 +53,18 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
-import adbutils
-import uiautomator2 as u2
-
-
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from console_output import configure_utf8_output
+from console_output import configure_utf8_output, run_with_logging, start_run_logging
+
+if __name__ == "__main__":
+    start_run_logging(__file__)
+
+import adbutils
+import uiautomator2 as u2
+from uiautomator2.exceptions import UiObjectNotFoundError
 import reddit_account_switcher
 
 
@@ -67,7 +74,7 @@ configure_utf8_output()
 # CONFIGURATION — edit this section
 # ─────────────────────────────────────────────────────────────────────────────
 
-DRY_RUN = False  # True = navigate but skip the final invite confirmation tap
+DRY_RUN = False  # Set True to make dry-run mode the default.
 
 # Source subreddits to browse for qualifying posts.
 # One subreddit is selected at random at the start of each run.
@@ -292,7 +299,7 @@ def timed_out(deadline: float) -> bool:
 
 
 def log_timeout_and_stop() -> bool:
-    log(f"Reached hard runtime limit of {MAX_RUNTIME_SECONDS // 60} minutes. Stopping.")
+    log("Reached the configured runtime limit. Stopping.")
     return True
 
 
@@ -498,8 +505,8 @@ def bounds_center(bounds: str) -> tuple[int, int]:
 
 
 def header_tap_point(bounds: str) -> tuple[int, int]:
-    left, top, right, _ = parse_bounds(bounds)
-    return ((left + right) // 2, top + 50)
+    left, top, right, bottom = parse_bounds(bounds)
+    return ((left + right) // 2, top + min(50, (bottom - top) // 2))
 
 
 def parse_bounds(bounds: str) -> tuple[int, int, int, int]:
@@ -634,23 +641,42 @@ def visible_post_cards(d) -> list[tuple[str, str]]:
         bounds = node.attrib.get("bounds", "")
         if not bounds:
             continue
-        candidate_nodes.append((node.attrib.get("resource-id", ""), bounds))
+        resource_id = node.attrib.get("resource-id", "").rsplit("/", 1)[-1]
+        candidate_nodes.append((resource_id, bounds))
+        # Current Card view sometimes omits all footer labels/IDs. Its four
+        # native groups are votes, comments, repost, share (verified on device).
+        # Use the second group's actual bounds rather than the embedded game.
+        children = list(node)
+        if resource_id == "post_footer" and len(children) == 4:
+            comment_bounds = children[1].attrib.get("bounds", "")
+            if comment_bounds and bounds_contains(bounds, comment_bounds):
+                left, top, right, bottom = parse_bounds(comment_bounds)
+                footer_left, _, footer_right, _ = parse_bounds(bounds)
+                if left < right and top < bottom and right <= (footer_left + footer_right) // 2:
+                    candidate_nodes.append(("unlabelled_footer_comment", comment_bounds))
 
     for node in root.iter("node"):
         desc = node.attrib.get("content-desc", "")
         bounds = node.attrib.get("bounds", "")
-        if not desc or "comment" not in desc.lower() or not bounds:
+        if not desc or not re.search(r"\d[\d.,]*\s*[km]?\s+comments?\b", desc, re.IGNORECASE) or not bounds:
+            continue
+        if "promoted post" in desc.lower():
+            continue
+        left, top, right, bottom = parse_bounds(bounds)
+        if right <= left or bottom <= top:
             continue
 
         tappable_bounds = bounds
         for preferred_resource_id in (
             "post_comment_button",
+            "actionBar_comment_button",
+            "unlabelled_footer_comment",
             "post_unit",
             "post_dev_platform_custom_post",
         ):
             matched_bounds = None
             for resource_id, candidate_bounds in candidate_nodes:
-                if resource_id == preferred_resource_id and bounds_contains(bounds, candidate_bounds):
+                if resource_id.rsplit("/", 1)[-1] == preferred_resource_id and bounds_contains(bounds, candidate_bounds):
                     matched_bounds = candidate_bounds
                     break
             if matched_bounds is not None:
@@ -814,7 +840,7 @@ def subreddit_deep_link(subreddit: str) -> str:
 
 def open_subreddit(d, subreddit: str):
     target_url = subreddit_deep_link(subreddit)
-    log(f"Opening r/{subreddit} sorted by {SOURCE_FEED_SORT}...")
+    log(f"Opening r/{subreddit}...")
     d.shell(
         f'am start -W -S -a android.intent.action.VIEW '
         f'-d "{target_url}" '
@@ -822,6 +848,21 @@ def open_subreddit(d, subreddit: str):
     )
     pause(5)
     dismiss_nsfw_modal(d)
+    sort_label = d(resourceId="sort_dropdown_label")
+    if sort_label.exists(timeout=3):
+        current_sort = sort_label.get_text().strip().lower()
+        if not current_sort.startswith(SOURCE_FEED_SORT.lower()):
+            safe_click(d, sort_label)
+            option = d(textMatches=rf"(?i)^{re.escape(SOURCE_FEED_SORT)}$")
+            if option.exists(timeout=2):
+                safe_click(d, option)
+                pause(2)
+            else:
+                log(f"WARNING: Feed sort '{SOURCE_FEED_SORT}' not available.")
+                go_back(d)
+        log(f"Feed sort shown: {sort_label.get_text()}")
+    else:
+        log("WARNING: Feed sort control not found; using current sort.")
     log(f"Subreddit opened via {target_url}.")
 
 
@@ -839,12 +880,33 @@ def ensure_target_account(d):
 # STEP 2: Find first post with MIN_COMMENTS+ comments and open it
 # ─────────────────────────────────────────────────────────────────────────────
 
+def scroll_subreddit_feed(d, scale: float = 0.65):
+    """Scroll outside embedded games, which consume swipes through the centre."""
+    width, height = d.window_size()
+    x = max(2, int(width * 0.015))
+    start_y = int(height * 0.78)
+    end_y = max(int(height * 0.22), start_y - int(height * scale))
+    run_shell_input(d, f"input swipe {x} {start_y} {x} {end_y} 400")
+
+
+def wait_for_comments(d, deadline: float) -> bool:
+    """Only report a thread opened once Reddit exposes its comment controls."""
+    until = min(deadline, time.monotonic() + 8)
+    while time.monotonic() < until:
+        if current_screen(d) == "comments":
+            return True
+        pause(0.5)
+    return False
+
+
 def find_qualifying_post(d, deadline: float, skipped_post_keys: set[str], source_subreddit: str) -> tuple[bool, str | None]:
     log(
         f"Scanning feed for a post with {MIN_COMMENTS}+ comments "
         f"(skipping {len(skipped_post_keys)} exhausted posts)..."
     )
     _, screen_height = d.window_size()
+    # Leave room for Reddit's bottom tabs and Android's navigation bar.
+    viewport_bottom = int(screen_height * 0.87)
 
     for scroll_num in range(MAX_FEED_SCROLLS):
         if timed_out(deadline):
@@ -852,8 +914,11 @@ def find_qualifying_post(d, deadline: float, skipped_post_keys: set[str], source
 
         ensure_reddit_feed_context(d, source_subreddit)
         found_candidate = False
+        scrolled_candidate = False
 
-        for desc, bounds in visible_post_cards(d):
+        cards = visible_post_cards(d)
+        log(f"  Feed scan {scroll_num + 1}: {len(cards)} cards; comment counts={[parse_comment_count(desc) for desc, _ in cards]}")
+        for desc, bounds in cards:
             card_key = post_card_key(desc)
             if card_key in skipped_post_keys:
                 continue
@@ -864,19 +929,26 @@ def find_qualifying_post(d, deadline: float, skipped_post_keys: set[str], source
 
             found_candidate = True
             _, top, _, bottom = parse_bounds(bounds)
-            if top > int(screen_height * 0.8) or bottom >= screen_height:
+            if top > int(screen_height * 0.8) or bottom > viewport_bottom:
                 log(f"  Found qualifying post with {count} comments, but it is too low on screen. Scrolling it into view...")
-                safe_swipe_up(d, scale=0.35)
+                scroll_subreddit_feed(d, scale=0.25)
+                scrolled_candidate = True
                 pause(0.7)
                 break
 
             log(f"  Found feed card with {count} comments — tapping post...")
             x, y = header_tap_point(bounds)
+            log(f"  Tap target: {bounds} at ({x}, {y})")
             log(f"Candidate summary: {summarize_post_description(desc)}")
             safe_tap_point(d, x, y)
             pause(2.2)
             dismiss_nsfw_modal(d)
-            return (True, card_key)
+            if wait_for_comments(d, deadline):
+                log("  Verified: thread comments are open.")
+                return (True, card_key)
+            log(f"  Tap did not open comments (screen='{current_screen(d)}'); continuing feed search.")
+            ensure_reddit_feed_context(d, source_subreddit)
+            break
 
         if not found_candidate:
             # Fallback for older Reddit layouts that expose comment count as text.
@@ -896,12 +968,19 @@ def find_qualifying_post(d, deadline: float, skipped_post_keys: set[str], source
                         safe_click(d, el)
                         pause(2.2)
                         dismiss_nsfw_modal(d)
-                        return (True, None)
+                        if wait_for_comments(d, deadline):
+                            log("  Verified: thread comments are open.")
+                            return (True, None)
+                        log("  Comment-count tap did not open comments; recovering the feed.")
+                        ensure_reddit_feed_context(d, source_subreddit)
+                        break
                 except Exception:
                     continue
 
         log(f"  Scroll {scroll_num + 1}/{MAX_FEED_SCROLLS} — no qualifying post yet.")
-        safe_swipe_up(d, scale=0.8)
+        # A low card was already moved above; scan it before scrolling again.
+        if not scrolled_candidate:
+            scroll_subreddit_feed(d)
         pause(0.9)
 
     log("ERROR: No qualifying post found after maximum scrolls.")
@@ -1047,7 +1126,55 @@ def visible_comment_snapshot(d) -> tuple[str, ...]:
 # STEP 5: Invite a single user (called when their profile screen is open)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def invite_user(d, username: str) -> str:
+def select_invite_community(d, username: str) -> bool:
+    """Select a native community tile, or use a genuine community search box."""
+    community_result = d(resourceId="com.reddit.frontpage:id/txt_name", textMatches=INVITE_COMMUNITY_PATTERN)
+    if community_result.exists(timeout=3):
+        log(f"  [{username}] Selecting the {INVITE_COMMUNITY} community tile.")
+        safe_click(d, community_result)
+        pause(1.3)
+        populate_invite_message(d, username, None)
+        return True
+
+    # Native sheets have a message composer but no community search input.
+    if d(resourceId="com.reddit.frontpage:id/txt_choose_community").exists(timeout=0.5):
+        log(f"  [{username}] Target community tile is unavailable. Skipping.")
+        return False
+
+    for attempt in range(2):
+        search_field = None
+        for field in iter_selector_elements(d(className="android.widget.EditText")):
+            info = field.info or {}
+            identity = " ".join(str(info.get(key) or "") for key in ("resourceName", "text", "contentDescription", "hint")).lower()
+            if "message" in identity:
+                continue
+            configured = RESOURCE_IDS["search_field"]
+            if "search" in identity or (configured and info.get("resourceName") == configured):
+                search_field = field
+                break
+        if search_field is None:
+            log(f"  [{username}] Community search field not found. Skipping.")
+            return False
+        try:
+            search_field.set_text(INVITE_COMMUNITY, timeout=3)
+            break
+        except UiObjectNotFoundError:
+            if attempt == 1:
+                log(f"  [{username}] Community search disappeared. Skipping this profile.")
+                return False
+            pause(0.8)
+    pause(2.6)
+    community_result = d(textMatches=INVITE_COMMUNITY_PATTERN)
+    if not community_result.exists(timeout=5):
+        log(f"  [{username}] Community not found in search results. Skipping.")
+        return False
+    safe_click(d, community_result)
+    pause(1.3)
+    populate_invite_message(d, username, search_field)
+    return True
+
+
+def invite_user(d, username: str, dry_run: bool = False) -> str:
     """
     Trigger the invite-to-community flow from the currently open profile screen.
 
@@ -1060,7 +1187,7 @@ def invite_user(d, username: str) -> str:
 
     def invite_ui_visible() -> bool:
         return (
-            d(textMatches=r"(?i)invite.*communit|communit.*invite|^invite$").exists(timeout=1)
+            d(textMatches=r"(?i)invite.*communit.*|communit.*invite.*|^invite$").exists(timeout=1)
             or d(text="Invite to Community").exists(timeout=1)
             or find_element(d, "search_field", className="android.widget.EditText").exists(timeout=1)
         )
@@ -1068,14 +1195,14 @@ def invite_user(d, username: str) -> str:
     # ── Find the Invite button (direct or via overflow menu) ──────────────────
     invite_btn = find_element(
         d, "invite_button",
-        textMatches=r"(?i)invite.*communit|communit.*invite|^invite$"
+        textMatches=r"(?i)invite.*communit.*|communit.*invite.*|^invite$"
     )
 
     if not invite_btn.exists(timeout=2):
         log(f"  [{username}] Opening profile overflow via top-right coordinate.")
         safe_tap_relative(d, *COORDINATE_FALLBACKS["profile_more_actions"])
         pause(1.5)
-        invite_btn = d(textMatches=r"(?i)invite.*communit|communit.*invite|^invite$")
+        invite_btn = d(textMatches=r"(?i)invite.*communit.*|communit.*invite.*|^invite$")
 
         if not invite_ui_visible():
             overflow = None
@@ -1089,7 +1216,7 @@ def invite_user(d, username: str) -> str:
                 log(f"  [{username}] Coordinate tap missed — retrying overflow by description.")
                 safe_click(d, overflow)
                 pause(1.2)
-                invite_btn = d(textMatches=r"(?i)invite.*communit|communit.*invite|^invite$")
+                invite_btn = d(textMatches=r"(?i)invite.*communit.*|communit.*invite.*|^invite$")
 
     if not invite_btn.exists(timeout=3):
         action_item = d(text="Invite to Community")
@@ -1104,29 +1231,10 @@ def invite_user(d, username: str) -> str:
         safe_click(d, invite_btn)
         pause(1.5)
 
-    # If the coordinate fallback missed and we are still on the profile/menu, stop here.
-    search_field = find_element(d, "search_field", className="android.widget.EditText")
-    if not search_field.exists(timeout=3):
-        log(f"  [{username}] Community search field not found. Skipping.")
+    if not select_invite_community(d, username):
         return "not_found"
 
-    # ── Type the community name in the search field ───────────────────────────
-    safe_click(d, search_field)
-    search_field.clear_text()
-    search_field.set_text(INVITE_MESSAGE_TEXT)
-    pause(2.6)  # wait for search results to populate
-
-    # ── Tap the correct community result ─────────────────────────────────────
-    community_result = d(textMatches=INVITE_COMMUNITY_PATTERN)
-    if not community_result.exists(timeout=5):
-        log(f"  [{username}] Community not found in search results. Skipping.")
-        return "not_found"
-
-    safe_click(d, community_result)
-    pause(1.3)
-    populate_invite_message(d, username, search_field)
-
-    if DRY_RUN:
+    if dry_run:
         log(f"  [{username}] DRY RUN — skipping send tap.")
         return "success"
 
@@ -1138,9 +1246,20 @@ def invite_user(d, username: str) -> str:
 
     sent = False
 
+    native_send = d(resourceId="com.reddit.frontpage:id/btn_invite")
+    if native_send.exists(timeout=1):
+        moderator_option = d(resourceId="com.reddit.frontpage:id/chk_invite_as_moderator")
+        if moderator_option.exists(timeout=0.5) and moderator_option.info.get("checked", False):
+            safe_click(d, moderator_option)
+        if not native_send.info.get("enabled", False):
+            log(f"  [{username}] Send invitation is disabled. Skipping.")
+            return "not_found"
+        safe_click(d, native_send)
+        sent = True
+
     # Strategy 1: text-based confirm button
     confirm_btn = d(textMatches=r"(?i)^invite$|^send invite$|^confirm$|^send$")
-    if confirm_btn.exists(timeout=2):
+    if not sent and confirm_btn.exists(timeout=2):
         safe_click(d, confirm_btn)
         sent = True
 
@@ -1162,7 +1281,8 @@ def invite_user(d, username: str) -> str:
             sent = True
 
     if not sent:
-        log(f"  [{username}] No explicit send button found — treating as auto-confirmed.")
+        log(f"  [{username}] No send button found; invitation was not sent.")
+        return "not_found"
 
     # ── Detect result via toast / snackbar / transient feedback text ─────────
     feedback_message, feedback_source, observed_toasts = wait_for_feedback_message(d, timeout=4.5)
@@ -1226,16 +1346,22 @@ def current_screen(d) -> str:
     except Exception:
         return "unknown"
 
-    resource_ids = {node.attrib.get("resource-id", "") for node in root.iter("node")}
+    resource_ids = {node.attrib.get("resource-id", "").rsplit("/", 1)[-1] for node in root.iter("node")}
     texts        = [node.attrib.get("text", "") for node in root.iter("node")]
     descs        = [node.attrib.get("content-desc", "") for node in root.iter("node")]
     classes      = [node.attrib.get("class", "") for node in root.iter("node")]
     labels       = [value.lower() for value in texts + descs if value]
 
+    if "btn_invite" in resource_ids and "txt_choose_community" in resource_ids:
+        return "invite"
     if "action_sort" in resource_ids:
         return "comments"
     if any(d.startswith("Level 1 comment by ") for d in descs):
         return "comments"
+    # Game feeds can expose no post descriptions until the first scroll. Their
+    # search fields belong to the game and must not be mistaken for invite UI.
+    if "feed_lazy_column" in resource_ids and "subreddit_screen_surface" in resource_ids:
+        return "feed"
     if "android.widget.EditText" in classes and any(
         "invite" in d.lower() or "community" in d.lower() or "search" in d.lower()
         for d in descs
@@ -1304,7 +1430,14 @@ def attempt_comment_scroll(d, scale: float | None = None, use_direct_scroll: boo
     return after != before
 
 
-def run_invite_loop(d, deadline: float, visited_users: set[str], source_subreddit: str) -> tuple[str, int]:
+def run_invite_loop(
+    d,
+    deadline: float,
+    visited_users: set[str],
+    source_subreddit: str,
+    dry_run: bool = False,
+    max_invites: int | None = None,
+) -> tuple[str, int]:
     tap_miss_counts: dict[str, int] = {}
     low_viewport_deferred: set[str] = set()
     consecutive_errors: int = 0
@@ -1399,13 +1532,18 @@ def run_invite_loop(d, deadline: float, visited_users: set[str], source_subreddi
             tap_miss_counts.pop(normalized, None)
             low_viewport_deferred.discard(normalized)
 
-            result = invite_user(d, username)
+            result = invite_user(d, username, dry_run=dry_run)
 
             # Navigate back to the comment list regardless of how many
             # screens the invite flow opened (Reddit sometimes auto-dismisses
             # the picker, leaving us already at the profile).
             navigate_back_to_comments(d, source_subreddit=source_subreddit)
             pause(0.6)
+
+            if dry_run:
+                visited_users.add(normalized)
+                log(f"  Dry run complete for u/{username}; tracking files were not changed.")
+                continue
 
             if result == "success":
                 visited_users.add(normalized)
@@ -1414,6 +1552,9 @@ def run_invite_loop(d, deadline: float, visited_users: set[str], source_subreddi
                 total_invited += 1
                 consecutive_errors = 0
                 log(f"  Invited. Total this session: {total_invited}")
+                if max_invites is not None and total_invited >= max_invites:
+                    log("Reached the requested invitation limit.")
+                    return ("invite_limit", total_invited)
 
             elif result == "error":
                 visited_users.add(normalized)
@@ -1459,18 +1600,18 @@ def run_invite_loop(d, deadline: float, visited_users: set[str], source_subreddi
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main():
-    deadline = time.monotonic() + MAX_RUNTIME_SECONDS
-    source_subreddit = random.choice(SOURCE_SUBREDDITS)
+def main(dry_run: bool = DRY_RUN, subreddit: str | None = None, max_runtime_seconds: int = MAX_RUNTIME_SECONDS, max_invites: int | None = None):
+    deadline = time.monotonic() + max_runtime_seconds
+    source_subreddit = subreddit or random.choice(SOURCE_SUBREDDITS)
     visited_users = load_invited_users()
     exhausted_post_keys: set[str] = set()
     total_invited = 0
     final_state = "started"
     d = None
 
-    if DRY_RUN:
+    if dry_run:
         log("=" * 60)
-        log("DRY RUN MODE — invite confirmations will be skipped.")
+        log("DRY RUN MODE — invite confirmations and tracking-file updates will be skipped.")
         log("=" * 60)
 
     log(f"Selected source subreddit: r/{source_subreddit}")
@@ -1529,7 +1670,10 @@ def main():
                 return
 
             filter_by_new(d)
-            result, invited_count = run_invite_loop(d, deadline, visited_users, source_subreddit)
+            result, invited_count = run_invite_loop(
+                d, deadline, visited_users, source_subreddit, dry_run=dry_run,
+                max_invites=None if max_invites is None else max_invites - total_invited,
+            )
             total_invited += invited_count
             log(
                 f"Post processing finished with result='{result}' and invited_count={invited_count}. "
@@ -1539,6 +1683,9 @@ def main():
             if result == "timed_out":
                 final_state = "timed_out"
                 log("Stopping run because the hard runtime limit was reached during comment processing.")
+                break
+            if result == "invite_limit":
+                final_state = "invite_limit"
                 break
             if result == "rate_limited":
                 final_state = "rate_limited"
@@ -1579,5 +1726,24 @@ def main():
     log("Script complete.")
 
 
+def cli():
+    parser = argparse.ArgumentParser(description="Invite commenters to a Reddit community.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=DRY_RUN,
+        help="navigate invite flows without confirming invites or updating tracking files",
+    )
+    parser.add_argument("--subreddit", choices=SOURCE_SUBREDDITS, help="use a specific source community")
+    parser.add_argument("--max-runtime-seconds", type=int, default=MAX_RUNTIME_SECONDS, help="stop after this runtime (default: 3600)")
+    parser.add_argument("--max-invites", type=int, help="stop after this many invitations are recorded")
+    args = parser.parse_args()
+    if args.max_runtime_seconds <= 0:
+        parser.error("--max-runtime-seconds must be positive")
+    if args.max_invites is not None and args.max_invites <= 0:
+        parser.error("--max-invites must be positive")
+    main(dry_run=args.dry_run, subreddit=args.subreddit, max_runtime_seconds=args.max_runtime_seconds, max_invites=args.max_invites)
+
+
 if __name__ == "__main__":
-    main()
+    run_with_logging(__file__, cli)

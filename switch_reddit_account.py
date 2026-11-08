@@ -7,10 +7,13 @@ import sys
 import time
 from pathlib import Path
 
+from console_output import configure_utf8_output, run_with_logging, start_run_logging
+
+if __name__ == "__main__":
+    start_run_logging(__file__)
+
 import adbutils
 import uiautomator2 as u2
-
-from console_output import configure_utf8_output
 
 
 configure_utf8_output()
@@ -124,4 +127,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_with_logging(__file__, main)

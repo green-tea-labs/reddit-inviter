@@ -23,9 +23,12 @@ Copy the relevant resource-id values into the CONFIG dict in daily_inviter/reddi
 
 import os
 import time
-import uiautomator2 as u2
+from console_output import configure_utf8_output, run_with_logging, start_run_logging
 
-from console_output import configure_utf8_output
+if __name__ == "__main__":
+    start_run_logging(__file__)
+
+import uiautomator2 as u2
 
 
 configure_utf8_output()
@@ -102,4 +105,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_with_logging(__file__, main)

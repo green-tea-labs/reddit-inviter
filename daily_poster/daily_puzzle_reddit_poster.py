@@ -25,15 +25,17 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime
 from pathlib import Path
 
-import adbutils
-import uiautomator2 as u2
-
-
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from console_output import configure_utf8_output
+from console_output import configure_utf8_output, run_with_logging, start_run_logging
+
+if __name__ == "__main__":
+    start_run_logging(__file__)
+
+import adbutils
+import uiautomator2 as u2
 import reddit_account_switcher
 
 
@@ -813,4 +815,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_with_logging(__file__, main)

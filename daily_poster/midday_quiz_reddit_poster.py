@@ -26,6 +26,15 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+
+from console_output import run_with_logging, start_run_logging
+
+if __name__ == "__main__":
+    start_run_logging(__file__)
+
 import daily_puzzle_reddit_poster as base
 
 
@@ -241,4 +250,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_with_logging(__file__, main)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import socket
 import sys
@@ -16,7 +17,10 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from console_output import configure_utf8_output
+from console_output import configure_utf8_output, run_with_logging, start_run_logging
+
+if __name__ == "__main__":
+    start_run_logging(__file__)
 
 
 configure_utf8_output()
@@ -168,7 +172,7 @@ class StatusHandler(BaseHTTPRequestHandler):
         self._send_html(payload)
 
     def log_message(self, format: str, *args):
-        return
+        logging.getLogger(__name__).debug("%s %s", self.client_address[0], format % args)
 
 
 def main():
@@ -179,4 +183,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_with_logging(__file__, main)
