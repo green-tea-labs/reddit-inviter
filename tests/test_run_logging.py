@@ -16,6 +16,7 @@ ENTRY_POINTS = (
     "switch_reddit_account.py",
     "discover_ui.py",
     "debug_reddit_feed.py",
+    "benchmark_inviter.py",
 )
 
 

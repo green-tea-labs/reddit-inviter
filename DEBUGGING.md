@@ -41,7 +41,36 @@ For a bounded invitation-flow test that skips Send and does not update invitatio
 .\.venv\Scripts\python.exe -u daily_inviter/reddit_inviter.py --dry-run --subreddit syllo --max-runtime-seconds 180
 ```
 
-Supported source communities are `dailyguess`, `dailymix`, `HotAndCold`, `syllo`, and `QuizPlanetGame`. Runtime limits are checked between operations; an in-progress UI operation can finish after the deadline.
+The fixed source order is `syllo`, `QuizPlanetGame`, `FitTheWord`, `ColorPuzzleGame`, `dailyguess`, `wordle`, `dailymix`, `NYTConnections`, `HotAndCold`, `WordleSpinoffs`, then `LETTERSET`. Runtime limits are checked between operations; an in-progress UI operation can finish after the deadline.
+
+Without `--subreddit`, the inviter follows that order, starting each new server-local date with **syllo → QuizPlanetGame → FitTheWord → ColorPuzzleGame**. Runs within the same day resume from `daily_inviter/source_progress.json`; yesterday's progress and older undated progress are ignored. Overnight runs save against their original date so the next run still starts the new day's priorities. Each community gets up to two threads or eight minutes per turn, and the bot moves on after six scans with no new candidates. Productive cycles continue until the overall runtime limit; exhausted thread keys are retained within the run. Dry runs leave the rotation file untouched. An explicit `--subreddit` isolates that source for testing.
+
+Threads with at least three comments are eligible. Reply authors are included, automated accounts are skipped, and unavailable invite actions are remembered only for the current session. The no-warning popup check takes one UI snapshot instead of waiting on six selectors. Existing send pacing and the consecutive-error stop remain in place.
+
+The added communities cover related word/puzzle interests: [Wordle](https://www.reddit.com/r/wordle/), [NYTConnections](https://www.reddit.com/r/NYTConnections/), and [WordleSpinoffs](https://www.reddit.com/r/WordleSpinoffs/).
+
+## Inviter benchmark
+
+```powershell
+.\.venv\Scripts\python.exe -u benchmark_inviter.py --label before --subreddit dailyguess --seconds 180
+# After updating the inviter, repeat with the same starting account and phone:
+.\.venv\Scripts\python.exe -u benchmark_inviter.py --label after --subreddit dailyguess --seconds 180
+```
+
+The benchmark always uses dry-run mode and refuses real sends. It saves JSON results and a copy of the tested inviter source under `logs/benchmarks/`. Results include unique visible/new users, completed dry invitation flows, function timings, and a check that invitation/tally files did not change. Function times are inclusive, so nested timings must not be added together. A UI flow in progress can finish after the time budget. Live Reddit content and network latency vary; a short dry benchmark measures navigation/discovery, not confirmed sends per day or the full community-rotation schedule.
+
+On 12 November 2026, matching 180-second-budget tests in `dailyguess`, starting from the posting account with the same 49,115-user invite history, produced:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Actual elapsed seconds (including finishing an active UI flow) | 183.90 | 191.81 |
+| Completed dry invite flows | 4 | 6 |
+| Completed dry flows per minute | 1.305 | 1.877 |
+| Unique not-previously-invited candidates observed | 6 | 6 |
+| Threads opened | 1 | 2 |
+| Popup-check wall time (seconds) | 29.53 | 4.79 |
+
+Both tests left invitation/tally files unchanged. This is approximately 44% higher dry-flow throughput in a small live-content sample; it does not establish a daily sending capacity. The JSON files are `before_2026-11-12_18-26-38_305804.json` and `after_2026-11-12_18-33-07_802173.json` in `logs/benchmarks/`.
 
 To deliberately test one real invitation:
 

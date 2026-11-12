@@ -45,6 +45,7 @@ If left as empty strings (""), the script falls back to text-based selectors.
 """
 
 import argparse
+import json
 import random
 import re
 import sys
@@ -77,13 +78,19 @@ configure_utf8_output()
 DRY_RUN = False  # Set True to make dry-run mode the default.
 
 # Source subreddits to browse for qualifying posts.
-# One subreddit is selected at random at the start of each run.
+# Fixed daily priority order. A new day always starts with these first four.
 SOURCE_SUBREDDITS = [
-    "dailyguess",
-    "dailymix",
-    "HotAndCold",
     "syllo",
-    "QuizPlanetGame"
+    "QuizPlanetGame",
+    "FitTheWord",
+    "ColorPuzzleGame",
+    "dailyguess",
+    "wordle",
+    "dailymix",
+    "NYTConnections",
+    "HotAndCold",
+    "WordleSpinoffs",
+    "LETTERSET",
 ]
 
 # Feed sort to use when opening the source subreddit.
@@ -103,7 +110,7 @@ TARGET_REDDIT_ACCOUNT = "u/Lazynick91"
 INVITE_MESSAGE_TEXT = ""
 
 # A post must have at least this many comments to qualify
-MIN_COMMENTS = 10
+MIN_COMMENTS = 3
 
 # Stop after this many consecutive "Unknown error" responses
 # (signals rate-limit OR user already invited)
@@ -111,6 +118,11 @@ MAX_CONSECUTIVE_ERRORS = 7
 
 # Maximum feed scrolls before giving up on finding a qualifying post
 MAX_FEED_SCROLLS = 125
+
+# Avoid spending a full session in one saturated community.
+MAX_SOURCE_SECONDS = 8 * 60
+MAX_POSTS_PER_SOURCE = 2
+MAX_KNOWN_ONLY_PASSES = 6
 
 # Maximum comment-list scrolls before considering all users processed
 MAX_COMMENT_SCROLLS = 25
@@ -139,6 +151,7 @@ SWIPE_X_JITTER_PX = 28
 # File that stores usernames already invited across previous runs.
 INVITED_USERS_FILE = Path(__file__).with_name("invited_users.txt")
 DAILY_TALLY_FILE = Path(__file__).with_name("daily_invite_tally.txt")
+SOURCE_PROGRESS_FILE = Path(__file__).with_name("source_progress.json")
 
 # ── Optional: paste resource-id values found via discover_ui.py ──────────────
 # Leave as "" to use text/description-based selectors (default, always works).
@@ -208,6 +221,35 @@ def extract_comment_author(description: str) -> str:
 
 def normalize_username(username: str) -> str:
     return extract_username(username).strip().lower()
+
+
+def source_order(subreddit: str | None = None, day: str | None = None) -> list[str]:
+    """Start each day in priority order, resuming progress within that day."""
+    if subreddit:
+        return [subreddit]
+    day = day or datetime.now().date().isoformat()
+    sources = list(dict.fromkeys(SOURCE_SUBREDDITS))
+    try:
+        progress = json.loads(SOURCE_PROGRESS_FILE.read_text(encoding="utf-8"))
+        next_source = progress.get("next_source") if isinstance(progress, dict) and progress.get("date") == day else None
+        offset = sources.index(next_source) if next_source in sources else 0
+    except (OSError, ValueError):
+        offset = 0
+    return sources[offset:] + sources[:offset]
+
+
+def remember_source_started(subreddit: str, day: str | None = None):
+    """Advance before browsing, so interrupted/short runs still cover sources."""
+    sources = list(dict.fromkeys(SOURCE_SUBREDDITS))
+    if subreddit not in sources:
+        return
+    next_source = sources[(sources.index(subreddit) + 1) % len(sources)]
+    try:
+        SOURCE_PROGRESS_FILE.write_text(
+            json.dumps({"date": day or datetime.now().date().isoformat(), "next_source": next_source}, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        log(f"WARNING: Could not save community rotation progress: {exc}")
 
 
 def load_invited_users() -> set[str]:
@@ -457,25 +499,25 @@ def find_element(d, resource_id_key: str, **text_kwargs):
 
 
 def dismiss_nsfw_modal(d, timeout: float = 3.5) -> bool:
-    """Dismiss Reddit's NSFW warning modal by pressing Continue if present."""
-    deadline = time.monotonic() + timeout
-
-    while time.monotonic() < deadline:
-        for selector in (
-            d(textMatches=r"(?i).*continue.*"),
-            d(textContains="Continue"),
-            d(descriptionMatches=r"(?i).*continue.*"),
-            d(descriptionContains="Continue"),
-            d(textMatches=r"(?i).*view.*anyway.*"),
-            d(descriptionMatches=r"(?i).*view.*anyway.*"),
-        ):
-            if selector.exists(timeout=0.2):
+    """Check once when no warning is present, rather than waiting on six selectors."""
+    root = ET.fromstring(d.dump_hierarchy())
+    labels = [node.get(key, "").strip() for node in root.iter("node")
+              for key in ("text", "content-desc")]
+    pattern = r"(?i)^(?:continue(?: anyway)?|view anyway)$"
+    if any(re.fullmatch(pattern, label) for label in labels):
+        for selector in (d(textMatches=pattern), d(descriptionMatches=pattern)):
+            if selector.exists(timeout=0.1):
                 log("NSFW modal detected — pressing Continue.")
                 safe_click(d, selector)
                 pause(0.8)
                 return True
-        pause(0.3)
-
+    # If a warning is still rendering, allow its button time to appear.
+    elif any(any(marker in label.lower() for marker in ("mature content", "over 18", "nsfw warning")) for label in labels):
+        selector = d(textMatches=pattern)
+        if selector.exists(timeout=timeout):
+            safe_click(d, selector)
+            pause(0.8)
+            return True
     return False
 
 
@@ -689,7 +731,10 @@ def visible_post_cards(d) -> list[tuple[str, str]]:
 
 
 def post_card_key(description: str) -> str:
-    return re.sub(r"\s+", " ", description).strip().lower()
+    # Vote/comment counts change while a post is being processed. Do not let
+    # that make an exhausted post look new again when returning to its feed.
+    stable = re.split(r",\s*[\d.,]+\s*[km]?\s+(?:upvotes?|votes?)\b", description, maxsplit=1, flags=re.IGNORECASE)[0]
+    return re.sub(r"\s+", " ", stable).strip().lower()
 def summarize_post_description(description: str, limit: int = 100) -> str:
     summary = re.sub(r"\s+", " ", description).strip()
     if len(summary) <= limit:
@@ -706,7 +751,7 @@ def visible_comment_headers(d) -> list[tuple[str, str]]:
     for node in root.iter("node"):
         desc = node.attrib.get("content-desc", "")
         bounds = node.attrib.get("bounds", "")
-        if desc.startswith("Level 1 comment by ") and bounds:
+        if re.match(r"Level \d+ comment by ", desc) and bounds:
             headers.append((desc, bounds))
 
     return headers
@@ -1067,16 +1112,22 @@ def get_visible_usernames(d) -> list[tuple]:
 
     def add(point: tuple[int, int], raw_name: str):
         name = extract_username(raw_name)
-        if name and name not in seen:
-            seen.add(name)
+        normalized = normalize_username(name)
+        if normalized in {"automoderator", "[deleted]", "[removed]"}:
+            return
+        if name and normalized not in seen:
+            seen.add(normalized)
             results.append((point, name))
 
-    for description, bounds in visible_comment_headers(d):
+    headers = visible_comment_headers(d)
+    for description, bounds in headers:
+        if "this account is automated" in description.lower():
+            continue
         username = extract_comment_author(description)
         if not username:
             continue
-        left, top, _, bottom = parse_bounds(bounds)
-        add((left + 120, (top + bottom) // 2), username)
+        left, top, right, bottom = parse_bounds(bounds)
+        add((left + min(120, max(1, (right - left) // 3)), (top + bottom) // 2), username)
 
     # Strategy A: resource-id (if configured)
     if RESOURCE_IDS["post_author"]:
@@ -1087,7 +1138,7 @@ def get_visible_usernames(d) -> list[tuple]:
                 pass
 
     # Strategy B: text starting with "u/"
-    if not results:
+    if not results and not headers:
         for el in iter_selector_elements(d(textMatches=r"^u/.+")):
             try:
                 add(element_center(el), el.get_text())
@@ -1095,7 +1146,7 @@ def get_visible_usernames(d) -> list[tuple]:
                 pass
 
     # Strategy C: content-description starting with "u/"
-    if not results:
+    if not results and not headers:
         for el in iter_selector_elements(d(descriptionMatches=r"^u/.+")):
             try:
                 add(element_center(el), el.info.get("contentDescription", ""))
@@ -1326,7 +1377,7 @@ def _on_comment_screen(d) -> bool:
     xml = d.dump_hierarchy(pretty=True)
     root = ET.fromstring(xml)
     return any(
-        node.attrib.get("content-desc", "").startswith("Level 1 comment by ")
+        re.match(r"Level \d+ comment by ", node.attrib.get("content-desc", ""))
         for node in root.iter("node")
     )
 
@@ -1356,7 +1407,7 @@ def current_screen(d) -> str:
         return "invite"
     if "action_sort" in resource_ids:
         return "comments"
-    if any(d.startswith("Level 1 comment by ") for d in descs):
+    if any(re.match(r"Level \d+ comment by ", desc) for desc in descs):
         return "comments"
     # Game feeds can expose no post descriptions until the first scroll. Their
     # search fields belong to the game and must not be mistaken for invite UI.
@@ -1443,6 +1494,7 @@ def run_invite_loop(
     consecutive_errors: int = 0
     total_invited: int = 0
     stalled_scrolls: int = 0
+    known_only_passes = 0
     _, screen_height = d.window_size()
     bottom_viewport_threshold = int(screen_height * 0.86)
 
@@ -1468,6 +1520,10 @@ def run_invite_loop(
         )
 
         if not new_users:
+            known_only_passes += 1
+            if known_only_passes >= MAX_KNOWN_ONLY_PASSES:
+                log("No new candidates across consecutive scans. Moving on from this thread.")
+                return ("post_exhausted", total_invited)
             if scroll_num >= MAX_COMMENT_SCROLLS:
                 log(
                     "Reached maximum comment scan passes on this post with no new invite targets. "
@@ -1488,6 +1544,7 @@ def run_invite_loop(
                     return ("post_exhausted", total_invited)
             continue
 
+        known_only_passes = 0
         stalled_scrolls = 0
         should_scroll_for_more = False
 
@@ -1573,6 +1630,9 @@ def run_invite_loop(
 
             # 'not_found' does not count toward the error limit
             else:
+                # An unavailable invite action should not be opened repeatedly
+                # during this run; it remains eligible on a future run.
+                visited_users.add(normalized)
                 update_daily_tally(processed_delta=1)
 
         if should_scroll_for_more:
@@ -1602,9 +1662,18 @@ def run_invite_loop(
 
 def main(dry_run: bool = DRY_RUN, subreddit: str | None = None, max_runtime_seconds: int = MAX_RUNTIME_SECONDS, max_invites: int | None = None):
     deadline = time.monotonic() + max_runtime_seconds
-    source_subreddit = subreddit or random.choice(SOURCE_SUBREDDITS)
+    # Keep an overnight run's progress attached to the day it began. The next
+    # run must still start the new day's priority list from the beginning.
+    rotation_day = datetime.now().date().isoformat()
+    sources = source_order(subreddit, day=rotation_day)
+    source_subreddit = sources[0]
+    source_index = -1
+    source_deadline = deadline
+    posts_in_source = 0
     visited_users = load_invited_users()
     exhausted_post_keys: set[str] = set()
+    exhausted_by_source: dict[str, set[str]] = {}
+    cycle_start_visited = len(visited_users)
     total_invited = 0
     final_state = "started"
     d = None
@@ -1615,6 +1684,7 @@ def main(dry_run: bool = DRY_RUN, subreddit: str | None = None, max_runtime_seco
         log("=" * 60)
 
     log(f"Selected source subreddit: r/{source_subreddit}")
+    log(f"Community order: {', '.join('r/' + source for source in sources)}")
 
     log("Checking ADB device visibility...")
     try:
@@ -1647,21 +1717,48 @@ def main(dry_run: bool = DRY_RUN, subreddit: str | None = None, max_runtime_seco
     # Keep display on while script runs
     d.screen_on()
 
+    def advance_source():
+        nonlocal source_index, source_subreddit, source_deadline, posts_in_source, exhausted_post_keys, cycle_start_visited
+        source_index += 1
+        if timed_out(deadline):
+            return False
+        if source_index >= len(sources):
+            if subreddit or len(visited_users) == cycle_start_visited:
+                return False
+            log("Community cycle found new candidates. Starting another pass without revisiting exhausted threads.")
+            cycle_start_visited = len(visited_users)
+            source_index = 0
+        source_subreddit = sources[source_index]
+        source_deadline = deadline if subreddit else min(deadline, time.monotonic() + MAX_SOURCE_SECONDS)
+        posts_in_source = 0
+        exhausted_post_keys = exhausted_by_source.setdefault(source_subreddit, set())
+        if not dry_run and not subreddit:
+            remember_source_started(source_subreddit, day=rotation_day)
+        log(f"Browsing community {source_index + 1}/{len(sources)}: r/{source_subreddit}")
+        open_subreddit(d, source_subreddit)
+        return True
+
     try:
         go_to_home_screen(d)
         ensure_target_account(d)
-        open_subreddit(d, source_subreddit)
+        advance_source()
 
         while not timed_out(deadline):
-            found_post, active_post_key = find_qualifying_post(d, deadline, exhausted_post_keys, source_subreddit)
+            if not subreddit and (posts_in_source >= MAX_POSTS_PER_SOURCE or timed_out(source_deadline)):
+                log("Community post/time budget reached. Moving to the next source.")
+                if not advance_source():
+                    final_state = "sources_exhausted"
+                    break
+            found_post, active_post_key = find_qualifying_post(d, source_deadline, exhausted_post_keys, source_subreddit)
             if not found_post:
                 if timed_out(deadline):
                     final_state = "timed_out"
-                    log("Script complete.")
-                    return
-                log("Could not find a qualifying post. Exiting.")
-                final_state = "no_post_found"
-                sys.exit(1)
+                    break
+                log("No qualifying thread found within this source's budget. Trying the next community.")
+                if not advance_source():
+                    final_state = "sources_exhausted"
+                    break
+                continue
 
             if timed_out(deadline):
                 log_timeout_and_stop()
@@ -1671,7 +1768,7 @@ def main(dry_run: bool = DRY_RUN, subreddit: str | None = None, max_runtime_seco
 
             filter_by_new(d)
             result, invited_count = run_invite_loop(
-                d, deadline, visited_users, source_subreddit, dry_run=dry_run,
+                d, source_deadline, visited_users, source_subreddit, dry_run=dry_run,
                 max_invites=None if max_invites is None else max_invites - total_invited,
             )
             total_invited += invited_count
@@ -1681,6 +1778,12 @@ def main(dry_run: bool = DRY_RUN, subreddit: str | None = None, max_runtime_seco
             )
 
             if result == "timed_out":
+                if not timed_out(deadline) and not subreddit:
+                    log("Community time budget reached during comments. Moving to the next source.")
+                    if advance_source():
+                        continue
+                    final_state = "sources_exhausted"
+                    break
                 final_state = "timed_out"
                 log("Stopping run because the hard runtime limit was reached during comment processing.")
                 break
@@ -1692,6 +1795,7 @@ def main(dry_run: bool = DRY_RUN, subreddit: str | None = None, max_runtime_seco
                 log("Stopping run because the consecutive error threshold suggests a rate limit or repeated invite failures.")
                 break
             if result in {"completed", "post_exhausted"}:
+                posts_in_source += 1
                 if active_post_key:
                     exhausted_post_keys.add(active_post_key)
                     if result == "completed":
@@ -1708,6 +1812,8 @@ def main(dry_run: bool = DRY_RUN, subreddit: str | None = None, max_runtime_seco
                     log("Post exhausted. Looking for another post with enough comments...")
                 continue
 
+        if final_state == "started" and timed_out(deadline):
+            final_state = "timed_out"
         log(f"Session invite total: {total_invited}")
         log(f"Final run state: {final_state}")
     except InputInjectionBlocked:
