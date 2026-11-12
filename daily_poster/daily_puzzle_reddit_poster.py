@@ -29,7 +29,7 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from console_output import configure_utf8_output, run_with_logging, start_run_logging
+from console_output import configure_utf8_output, get_run_log_path, run_with_logging, start_run_logging
 
 if __name__ == "__main__":
     start_run_logging(__file__)
@@ -211,6 +211,31 @@ def current_package_name(d) -> str:
 
 def reddit_in_foreground(d) -> bool:
     return current_package_name(d) == "com.reddit.frontpage"
+
+
+def save_ui_diagnostics(d, label="failure"):
+    """Save the UI before cleanup closes Reddit."""
+    if d is None:
+        return
+    run_path = get_run_log_path()
+    if run_path is None:
+        folder = WORKSPACE_ROOT / "logs" / "poster_diagnostics"
+        folder.mkdir(parents=True, exist_ok=True)
+        run_path = folder / datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f.txt")
+    for suffix, save in (
+        (f".{label}.xml", lambda path: path.write_text(d.dump_hierarchy(pretty=True), encoding="utf-8")),
+        (f".{label}.png", lambda path: d.screenshot().save(str(path))),
+    ):
+        path = run_path.with_suffix(suffix)
+        try:
+            save(path)
+            log(f"UI diagnostic saved: {path}")
+        except Exception as exc:
+            log(f"Could not capture failure diagnostic {path.name}: {exc}")
+
+
+def save_failure_diagnostics(d):
+    save_ui_diagnostics(d)
 
 
 def close_reddit_app(d):
@@ -529,7 +554,22 @@ def confirm_flair_selection(d) -> bool:
     return False
 
 
+def reveal_composer_header(d):
+    """Hide the keyboard and bring title/flair controls back into view."""
+    root = ET.fromstring(d.dump_hierarchy())
+    if any(
+        "inputmethod" in node.get("package", "") or "honeyboard" in node.get("package", "")
+        for node in root.iter("node")
+    ):
+        d.press("back")
+        pause(0.8)
+    width, height = d.window_size()
+    d.swipe(width // 2, int(height * 0.3), width // 2, int(height * 0.75), 0.4)
+    pause(0.8)
+
+
 def ensure_post_flair(d, flair_name: str) -> bool:
+    reveal_composer_header(d)
     current_texts = visible_feedback_texts(d)
     if any(text.strip().lower() == flair_name.lower() for text in current_texts):
         log(f"Post flair already set to {flair_name}.")
@@ -682,7 +722,8 @@ def populate_post_form(d, post_payload: dict[str, str]):
     else:
         log("Body field was not exposed by the current Reddit UI. Continuing with title and link only.")
 
-    ensure_post_flair(d, TARGET_FLAIR)
+    if not ensure_post_flair(d, TARGET_FLAIR):
+        raise RuntimeError(f"Could not apply required post flair: {TARGET_FLAIR}")
 
 
 def composer_still_visible(d) -> bool:

@@ -31,6 +31,22 @@
       "title": "How far can you get in today’s challenge set? 🧠 (14/07)",
       "url": "https://www.pineapplecactus.com/daily-challenges",
       "details": "Daily challenge form populated without submitting."
+    },
+    {
+      "date": "2026-11-12",
+      "submitted_at": "2026-11-12T18:12:24",
+      "status": "dry_run",
+      "title": "Your daily challenge link is here 🧩 (12/11)",
+      "url": "https://www.pineapplecactus.com/daily-challenges/2026-11-12",
+      "details": "Daily challenge form populated without submitting."
+    },
+    {
+      "date": "2026-11-12",
+      "submitted_at": "2026-11-12T18:17:06",
+      "status": "dry_run",
+      "title": "Your daily challenge link is here 🧩 (12/11)",
+      "url": "https://www.pineapplecactus.com/daily-challenges/2026-11-12",
+      "details": "Daily challenge form populated without submitting."
     }
   ]
 }

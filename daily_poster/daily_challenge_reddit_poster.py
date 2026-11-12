@@ -18,6 +18,7 @@ Set DRY_RUN = True below to test navigation and form filling without tapping Pos
 
 from __future__ import annotations
 
+import argparse
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -226,16 +227,17 @@ def build_post_payload(post_day: date | None = None) -> dict[str, str]:
     return payload
 
 
-def main():
+def main(dry_run: bool = DRY_RUN):
 
     started_at = datetime.now()
     deadline = base.time.monotonic() + base.MAX_RUNTIME_SECONDS
     post_day = date.today()
     post_payload = build_post_payload(post_day)
+    base.DRY_RUN = dry_run
     submission_recorded = False
     d = None
 
-    if base.successful_post_exists(post_day):
+    if not base.DRY_RUN and base.successful_post_exists(post_day):
         base.log("A successful daily challenge post is already recorded for today. Exiting without posting again.")
         return
 
@@ -280,6 +282,7 @@ def main():
         base.populate_post_form(d, post_payload)
 
         if base.DRY_RUN:
+            base.save_ui_diagnostics(d, "dry-run")
             base.record_post_attempt(post_payload, "dry_run", "Daily challenge form populated without submitting.")
             base.log("Dry run complete. Review the populated Reddit form on the device.")
             return
@@ -298,6 +301,7 @@ def main():
         base.log("Enable any device-specific USB debugging security options, then try again.")
         sys.exit(1)
     except Exception as exc:
+        base.save_failure_diagnostics(d)
         if not base.DRY_RUN and not submission_recorded:
             base.record_post_attempt(post_payload, "crashed", str(exc))
         raise
@@ -308,5 +312,12 @@ def main():
         base.log(f"Runtime: {elapsed} seconds")
 
 
+def cli():
+    parser = argparse.ArgumentParser(description="Post today's daily challenge to Reddit.")
+    parser.add_argument("--dry-run", action="store_true", default=DRY_RUN,
+                        help="populate the form without tapping Post")
+    main(dry_run=parser.parse_args().dry_run)
+
+
 if __name__ == "__main__":
-    run_with_logging(__file__, main)
+    run_with_logging(__file__, cli)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import time
+import xml.etree.ElementTree as ET
 
 
 REDDIT_PACKAGE = "com.reddit.frontpage"
@@ -67,6 +68,23 @@ def visible_texts(d) -> list[str]:
         return texts
 
     return texts
+
+
+def ensure_device_unlocked(d, log):
+    """Dismiss a swipe lock; never try entering or bypassing a PIN/password."""
+    d.screen_on()
+    d.shell("wm dismiss-keyguard")
+    for _ in range(4):
+        root = ET.fromstring(d.dump_hierarchy())
+        locked = any(
+            node.get("resource-id", "").startswith("com.android.systemui:id/keyguard_")
+            for node in root.iter("node")
+        )
+        if not locked:
+            log("Phone is awake and the lock-screen overlay is dismissed.")
+            return
+        time.sleep(0.5)
+    raise RuntimeError("Phone is locked. Unlock it manually before running Reddit automation.")
 
 
 def open_reddit_home(d, pause):
@@ -140,7 +158,7 @@ def select_account_row(d, target_username: str, safe_click) -> bool:
             safe_click(d, row)
             return True
 
-    fallback = d(textMatches=rf"(?i)^u/{re.escape(target_normalized)}$")
+    fallback = d(textMatches=rf"(?i)^(?:u/)?{re.escape(target_normalized)}$")
     if fallback.exists(timeout=0.5):
         safe_click(d, fallback)
         return True
@@ -172,6 +190,7 @@ def switch_reddit_account(d, target_username: str, log, pause, safe_click) -> bo
     formatted_target = format_account_username(target_username)
     target_normalized = normalize_account_username(target_username)
 
+    ensure_device_unlocked(d, log)
     open_reddit_home(d, pause)
 
     if not open_profile_tab(d, log, pause, safe_click):
@@ -186,6 +205,7 @@ def switch_reddit_account(d, target_username: str, log, pause, safe_click) -> bo
         raise RuntimeError("Could not open the Reddit account switcher.")
 
     if not select_account_row(d, target_username, safe_click):
+        log(f"Visible account-switcher labels: {visible_texts(d)}")
         raise RuntimeError(f"The account {formatted_target} was not found in the Reddit account switcher.")
 
     pause(3.0)

@@ -112,6 +112,11 @@ class _TeeStream:
         raise AttributeError(name)
 
 
+def get_run_log_path():
+    """Return this process's active log path, if logging has started."""
+    return _active_run.path if _active_run is not None else None
+
+
 def start_run_logging(script_path, *, log_root=None):
     """Start once, before optional dependencies load, and return the log path."""
     global _active_run

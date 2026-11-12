@@ -10,6 +10,19 @@ Logging covers the inviter, all three posters, the account switcher, UI discover
 
 When a script fails, start with the newest text file in its folder and look at the final actions and traceback. Copy the updated scripts and `console_output.py` to the downstairs PC so it gets the same logging.
 
+## Poster dry runs
+
+Run the two posters sequentially against the connected phone:
+
+```powershell
+.\.venv\Scripts\python.exe -u daily_poster/daily_challenge_reddit_poster.py --dry-run
+.\.venv\Scripts\python.exe -u daily_poster/midday_quiz_reddit_poster.py --dry-run
+```
+
+These switch to the posting account and populate the form, including its flair, but never tap Post. They can run even if a successful post is already recorded today. Dry runs are recorded as `dry_run`, so they do not count as a successful daily post. Screenshots and UI XML are saved beside the run log before Reddit closes; failures also capture that screen.
+
+The account switcher dismisses simple swipe locks and accepts account labels with or without `u/`. A PIN/password lock still needs manual unlocking. The composer hides a visible keyboard and scrolls toward the header before choosing flair. Missing required flair stops the run before posting.
+
 ## Navigation tests
 
 Run commands from the repository root, with the phone unlocked and USB debugging authorized.

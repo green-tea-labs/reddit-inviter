@@ -16,6 +16,7 @@ Set DRY_RUN = True below to test navigation and form filling without tapping Pos
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
@@ -313,8 +314,9 @@ def build_post_payload(post_day: date | None = None) -> dict[str, str]:
     }
 
 
-def main():
+def main(dry_run: bool = DRY_RUN):
     configure_base_module()
+    base.DRY_RUN = dry_run
 
     started_at = datetime.now()
     deadline = base.time.monotonic() + base.MAX_RUNTIME_SECONDS
@@ -323,7 +325,7 @@ def main():
 
     post_payload = build_post_payload()
 
-    if base.successful_post_exists(date.today()):
+    if not base.DRY_RUN and base.successful_post_exists(date.today()):
         base.log("A successful midday quiz post is already recorded for today. Exiting without posting again.")
         return
 
@@ -371,6 +373,7 @@ def main():
         base.populate_post_form(d, post_payload)
 
         if base.DRY_RUN:
+            base.save_ui_diagnostics(d, "dry-run")
             base.record_post_attempt(post_payload, "dry_run", "Midday quiz form populated without submitting.")
             base.log("Dry run complete. Review the populated Reddit form on the device.")
             return
@@ -389,6 +392,7 @@ def main():
         base.log("Enable any device-specific USB debugging security options, then try again.")
         sys.exit(1)
     except Exception as exc:
+        base.save_failure_diagnostics(d)
         if not base.DRY_RUN and not submission_recorded:
             base.record_post_attempt(post_payload, "crashed", str(exc))
         raise
@@ -399,5 +403,12 @@ def main():
         base.log(f"Runtime: {elapsed} seconds")
 
 
+def cli():
+    parser = argparse.ArgumentParser(description="Post today's midday quiz to Reddit.")
+    parser.add_argument("--dry-run", action="store_true", default=DRY_RUN,
+                        help="populate the form without tapping Post")
+    main(dry_run=parser.parse_args().dry_run)
+
+
 if __name__ == "__main__":
-    run_with_logging(__file__, main)
+    run_with_logging(__file__, cli)
