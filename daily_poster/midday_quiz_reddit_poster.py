@@ -211,6 +211,14 @@ BODY_FOOTERS = [
 
 
 def configure_base_module():
+    missing = [name for name in ("save_ui_diagnostics", "save_failure_diagnostics")
+               if not callable(getattr(base, name, None))]
+    if missing:
+        raise RuntimeError(
+            f"Shared poster helper is out of date: {base.__file__}. "
+            f"Missing: {', '.join(missing)}. Copy the updated daily_poster/daily_puzzle_reddit_poster.py "
+            "alongside this script, then restart it."
+        )
     base.DRY_RUN = DRY_RUN
     base.TARGET_SUBREDDIT = TARGET_SUBREDDIT
     base.TARGET_FLAIR = TARGET_FLAIR
@@ -392,7 +400,10 @@ def main(dry_run: bool = DRY_RUN):
         base.log("Enable any device-specific USB debugging security options, then try again.")
         sys.exit(1)
     except Exception as exc:
-        base.save_failure_diagnostics(d)
+        try:
+            base.save_failure_diagnostics(d)
+        except Exception as diagnostic_error:
+            base.log(f"Could not capture failure diagnostics: {diagnostic_error}")
         if not base.DRY_RUN and not submission_recorded:
             base.record_post_attempt(post_payload, "crashed", str(exc))
         raise

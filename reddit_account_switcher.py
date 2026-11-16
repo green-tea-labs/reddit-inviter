@@ -52,18 +52,15 @@ def current_account_username(d) -> str:
 
 
 def visible_texts(d) -> list[str]:
+    """Read one stable snapshot instead of enumerating live, shifting indexes."""
     texts: list[str] = []
     try:
-        for selector in (
-            d(className="android.widget.TextView"),
-            d(className="android.view.View"),
-        ):
-            for element in iter_selector_elements(selector):
-                info = getattr(element, "info", {}) or {}
-                for key in ("text", "contentDescription"):
-                    value = (info.get(key) or "").strip()
-                    if value and value not in texts:
-                        texts.append(value)
+        root = ET.fromstring(d.dump_hierarchy())
+        for node in root.iter("node"):
+            for key in ("text", "content-desc"):
+                value = node.get(key, "").strip()
+                if value and value not in texts:
+                    texts.append(value)
     except Exception:
         return texts
 
@@ -117,29 +114,38 @@ def open_profile_tab(d, log, pause, safe_click) -> bool:
 
 
 def account_switcher_sheet_visible(d) -> bool:
-    if d(textMatches=r"(?i)^accounts$").exists(timeout=0.2):
-        return True
+    # A profile's u/name alone does not mean that its account sheet opened.
+    labels = {text.strip().lower() for text in visible_texts(d)}
+    return bool(labels & {"accounts", "add account", "anonymous browsing", "incognito"})
 
-    if d(textMatches=r"(?i)^anonymous browsing$").exists(timeout=0.2):
-        return True
 
-    if d(textMatches=r"(?i)^add account$").exists(timeout=0.2):
-        return True
-
-    for text in visible_texts(d):
-        if text.lower().startswith("u/"):
+def wait_for_account_switcher(d, pause, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if account_switcher_sheet_visible(d):
             return True
-
+        pause(0.5)
     return False
 
 
 def open_account_switcher(d, log, pause, safe_click) -> bool:
-    button = d(resourceId="account_switcher_button")
-    if button.exists(timeout=0.8):
-        log("Opening the account switcher.")
-        safe_click(d, button)
-        pause(ACCOUNT_SWITCHER_DELAY_SECONDS)
-        return account_switcher_sheet_visible(d)
+    for attempt in range(2):
+        if account_switcher_sheet_visible(d):
+            return True
+        button = d(resourceId="account_switcher_button")
+        if not button.exists(timeout=1.0):
+            log("Account-switcher button is not visible on the profile screen.")
+            return False
+        log(f"Opening the account switcher (attempt {attempt + 1}/2).")
+        try:
+            safe_click(d, button)
+        except Exception as exc:
+            log(f"Account-switcher tap failed while the UI changed: {exc}")
+            pause(0.5)
+            continue
+        if wait_for_account_switcher(d, pause):
+            return True
+        log("Account sheet was not detected after the tap. Rechecking before retrying.")
     return False
 
 
@@ -171,6 +177,9 @@ def wait_for_account_switch(d, target_username: str, pause, safe_click) -> bool:
     target_normalized = normalize_account_username(target_username)
 
     while time.monotonic() < deadline:
+        if account_switcher_sheet_visible(d):
+            pause(0.6)
+            continue
         if d(resourceId="account_switcher_button").exists(timeout=0.3):
             current = current_account_username(d)
             if current == target_normalized:
@@ -202,6 +211,7 @@ def switch_reddit_account(d, target_username: str, log, pause, safe_click) -> bo
         return True
 
     if not open_account_switcher(d, log, pause, safe_click):
+        log(f"Visible labels after account-switcher attempts: {visible_texts(d)}")
         raise RuntimeError("Could not open the Reddit account switcher.")
 
     if not select_account_row(d, target_username, safe_click):

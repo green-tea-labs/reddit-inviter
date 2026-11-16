@@ -23,6 +23,10 @@ These switch to the posting account and populate the form, including its flair, 
 
 The account switcher dismisses simple swipe locks and accepts account labels with or without `u/`. A PIN/password lock still needs manual unlocking. The composer hides a visible keyboard and scrolls toward the header before choosing flair. Missing required flair stops the run before posting.
 
+Account-sheet detection uses one hierarchy snapshot, waits for the menu to appear, and retries a missed tap once. An already-open sheet is not tapped closed. A profile's `u/name` alone is not treated as an open account sheet.
+
+Deploy the poster scripts and their shared helper together: `reddit_account_switcher.py`, `daily_poster/daily_puzzle_reddit_poster.py`, `daily_poster/daily_challenge_reddit_poster.py`, and `daily_poster/midday_quiz_reddit_poster.py`. The latter two reject an older helper that lacks diagnostic support, reporting its exact path before interacting with the phone. Diagnostic capture is best-effort and cannot replace the original posting/account-switching exception.
+
 ## Navigation tests
 
 Run commands from the repository root, with the phone unlocked and USB debugging authorized.

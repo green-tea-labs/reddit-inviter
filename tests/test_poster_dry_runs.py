@@ -11,6 +11,59 @@ import reddit_account_switcher as accounts
 
 
 class PosterDryRunTests(unittest.TestCase):
+    def test_account_sheet_detection_uses_snapshot_and_does_not_mistake_profile(self):
+        device = Mock()
+        device.dump_hierarchy.return_value = '<hierarchy><node text="u/PineappleCactusQuiz" /></hierarchy>'
+        self.assertFalse(accounts.account_switcher_sheet_visible(device))
+        device.dump_hierarchy.return_value = '<hierarchy><node text="Accounts" /><node text="PineappleCactusQuiz" /><node content-desc="Add account" /></hierarchy>'
+        self.assertTrue(accounts.account_switcher_sheet_visible(device))
+        device.assert_not_called()
+
+    def test_account_sheet_waits_for_animation(self):
+        with patch.object(accounts, "account_switcher_sheet_visible", side_effect=[False, True]), patch.object(accounts.time, "monotonic", side_effect=[0, 0.1, 0.2]):
+            pause = Mock()
+            self.assertTrue(accounts.wait_for_account_switcher(Mock(), pause))
+            pause.assert_called_once_with(0.5)
+
+    def test_account_sheet_retry_is_bounded(self):
+        device = Mock()
+        device.return_value.exists.return_value = True
+        click = Mock()
+        with patch.object(accounts, "account_switcher_sheet_visible", return_value=False), patch.object(accounts, "wait_for_account_switcher", side_effect=[False, True]):
+            self.assertTrue(accounts.open_account_switcher(device, Mock(), Mock(), click))
+        self.assertEqual(click.call_count, 2)
+
+    def test_open_sheet_is_not_tapped_closed_again(self):
+        click = Mock()
+        with patch.object(accounts, "account_switcher_sheet_visible", return_value=True):
+            self.assertTrue(accounts.open_account_switcher(Mock(), Mock(), Mock(), click))
+        click.assert_not_called()
+
+    def test_mixed_poster_versions_fail_with_exact_helper_path(self):
+        for module in (challenge, midday):
+            with self.subTest(module=module.__name__), patch.object(module.base, "save_failure_diagnostics", None):
+                with self.assertRaisesRegex(RuntimeError, "Shared poster helper is out of date") as caught:
+                    module.configure_base_module()
+                self.assertIn(str(module.base.__file__), str(caught.exception))
+
+    def test_diagnostic_failure_does_not_mask_switching_error(self):
+        payload = {"title": "Test", "url": "https://example.com", "body": "Test"}
+        for module in (challenge, midday):
+            with self.subTest(module=module.__name__):
+                original_dry_run = module.base.DRY_RUN
+                try:
+                    with patch.object(module, "build_post_payload", return_value=payload), patch.object(module, "configure_base_module"), patch.multiple(
+                        module.base, adb_connected_devices=Mock(return_value=["phone"]),
+                        u2=Mock(connect=Mock(return_value=Mock(device_info={}))), go_to_home_screen=Mock(),
+                        ensure_target_account=Mock(side_effect=RuntimeError("original account error")),
+                        save_failure_diagnostics=Mock(side_effect=OSError("screenshot failed")),
+                        close_reddit_app=Mock(),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "original account error"):
+                            module.main(dry_run=True)
+                finally:
+                    module.base.DRY_RUN = original_dry_run
+
     def test_both_dry_runs_populate_but_never_submit_or_check_success_history(self):
         payload = {"title": "Test quiz", "url": "https://example.com/quiz", "body": "Test body"}
         keys = ("DRY_RUN", "TARGET_SUBREDDIT", "TARGET_URL", "TARGET_FLAIR", "TARGET_REDDIT_ACCOUNT",
