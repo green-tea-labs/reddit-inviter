@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from uiautomator2.exceptions import RPCUnknownError, UiObjectNotFoundError
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "daily_poster"))
 import daily_challenge_reddit_poster as challenge
 import midday_quiz_reddit_poster as midday
@@ -99,7 +101,8 @@ class PosterDryRunTests(unittest.TestCase):
 
     def test_account_fallback_matches_exact_names_with_or_without_u_prefix(self):
         device = Mock()
-        missing_rows = Mock(count=0)
+        missing_rows = Mock()
+        missing_rows.exists.return_value = False
         target = Mock()
         target.exists.return_value = True
         device.side_effect = [missing_rows, target]
@@ -110,6 +113,93 @@ class PosterDryRunTests(unittest.TestCase):
             self.assertIsNotNone(re.fullmatch(pattern, label))
         self.assertIsNone(re.fullmatch(pattern, "OtherPineappleCactusQuiz"))
         click.assert_called_once_with(device, target)
+
+    def test_account_row_is_refreshed_after_stale_or_missing_object_error(self):
+        for native in (False, True):
+            for error in (
+                RPCUnknownError("Unknown RPC error: -32001 androidx.test.uiautomator.StaleObjectException"),
+                UiObjectNotFoundError("Account row disappeared during animation"),
+            ):
+                with self.subTest(native=native, error=type(error).__name__):
+                    missing, old_row, fresh_row = Mock(), Mock(), Mock()
+                    missing.exists.return_value = False
+                    old_row.exists.return_value = fresh_row.exists.return_value = True
+                    device = Mock(side_effect=[old_row, fresh_row] if native else [missing, old_row, missing, fresh_row])
+                    click, pause, log = Mock(side_effect=[error, None]), Mock(), Mock()
+                    with patch.object(accounts, "account_switcher_sheet_visible", return_value=True):
+                        self.assertTrue(accounts.select_account_row(device, "PineappleCactusQuiz", click, pause=pause, log=log))
+                    self.assertIs(click.call_args_list[0].args[1], old_row)
+                    self.assertIs(click.call_args_list[1].args[1], fresh_row)
+                    pause.assert_called_once_with(0.75)
+                    self.assertTrue(any("became stale" in call.args[0] for call in log.call_args_list))
+
+    def test_account_row_can_appear_after_sheet_header(self):
+        missing, target = Mock(), Mock()
+        missing.exists.return_value = False
+        target.exists.return_value = True
+        device = Mock(side_effect=[missing, missing, target])
+        click, pause = Mock(), Mock()
+        with patch.object(accounts, "account_switcher_sheet_visible", return_value=True):
+            self.assertTrue(accounts.select_account_row(device, "PineappleCactusQuiz", click, pause=pause))
+        pause.assert_called_once_with(0.75)
+        click.assert_called_once_with(device, target)
+
+    def test_repeated_stale_account_row_stops_with_original_error(self):
+        device = Mock()
+        device.return_value.exists.return_value = True
+        error = RPCUnknownError("androidx.test.uiautomator.StaleObjectException")
+        click, pause = Mock(side_effect=error), Mock()
+        with patch.object(accounts, "account_switcher_sheet_visible", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "account row kept changing") as caught:
+                accounts.select_account_row(device, "PineappleCactusQuiz", click, pause=pause)
+        self.assertIs(caught.exception.__cause__, error)
+        self.assertEqual(click.call_count, 3)
+        self.assertEqual(pause.call_count, 2)
+
+    def test_missing_account_row_stops_without_clicking(self):
+        device = Mock()
+        device.return_value.exists.return_value = False
+        click, pause = Mock(), Mock()
+        with patch.object(accounts, "account_switcher_sheet_visible", return_value=True):
+            self.assertFalse(accounts.select_account_row(device, "PineappleCactusQuiz", click, pause=pause))
+        click.assert_not_called()
+        self.assertEqual(pause.call_count, 2)
+
+    def test_closed_sheet_after_row_error_requires_verification_without_retapping(self):
+        for verified in (False, True):
+            with self.subTest(verified=verified):
+                device = Mock()
+                device.return_value.exists.return_value = True
+                click = Mock(side_effect=RPCUnknownError("androidx.test.uiautomator.StaleObjectException"))
+                pause = Mock()
+                with patch.object(accounts, "account_switcher_sheet_visible", return_value=False), patch.object(
+                    accounts, "wait_for_account_switch", return_value=verified
+                ) as verify:
+                    self.assertEqual(accounts.select_account_row(device, "PineappleCactusQuiz", click, pause=pause), verified)
+                click.assert_called_once()
+                verify.assert_called_once_with(device, "PineappleCactusQuiz", pause, click)
+
+    def test_unrelated_account_row_errors_are_not_retried(self):
+        for error in (RPCUnknownError("Device RPC connection failed"), RuntimeError("Input injection blocked")):
+            with self.subTest(error=type(error).__name__):
+                device = Mock()
+                device.return_value.exists.return_value = True
+                click, pause = Mock(side_effect=error), Mock()
+                with self.assertRaises(type(error)) as caught:
+                    accounts.select_account_row(device, "PineappleCactusQuiz", click, pause=pause)
+                self.assertIs(caught.exception, error)
+                click.assert_called_once()
+                pause.assert_not_called()
+
+    def test_successful_account_row_tap_still_requires_correct_active_account(self):
+        with patch.multiple(
+            accounts, ensure_device_unlocked=Mock(), open_reddit_home=Mock(),
+            open_profile_tab=Mock(return_value=True), current_account_username=Mock(return_value="other_account"),
+            open_account_switcher=Mock(return_value=True), select_account_row=Mock(return_value=True),
+            wait_for_account_switch=Mock(return_value=False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not finish switching"):
+                accounts.switch_reddit_account(Mock(), "PineappleCactusQuiz", Mock(), Mock(), Mock())
 
     def test_swipe_lock_is_dismissed_before_account_navigation(self):
         device = Mock()

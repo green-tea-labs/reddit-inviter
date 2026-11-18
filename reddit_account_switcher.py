@@ -6,11 +6,14 @@ import re
 import time
 import xml.etree.ElementTree as ET
 
+from uiautomator2.exceptions import RPCUnknownError, UiObjectNotFoundError
+
 
 REDDIT_PACKAGE = "com.reddit.frontpage"
 PROFILE_OPEN_DELAY_SECONDS = 4.0
 ACCOUNT_SWITCHER_DELAY_SECONDS = 2.5
 ACCOUNT_SWITCH_TIMEOUT_SECONDS = 10.0
+ACCOUNT_ROW_MAX_ATTEMPTS = 3
 
 
 def normalize_account_username(username: str) -> str:
@@ -23,11 +26,6 @@ def normalize_account_username(username: str) -> str:
 def format_account_username(username: str) -> str:
     normalized = normalize_account_username(username)
     return f"u/{normalized}"
-
-
-def iter_selector_elements(selector):
-    for index in range(selector.count):
-        yield selector[index]
 
 
 def current_account_username(d) -> str:
@@ -149,25 +147,47 @@ def open_account_switcher(d, log, pause, safe_click) -> bool:
     return False
 
 
-def select_account_row(d, target_username: str, safe_click) -> bool:
+def select_account_row(d, target_username: str, safe_click, *, log=None, pause=None) -> bool:
+    """Re-query an exact account row when the sheet replaces its UI objects."""
+    log = log or (lambda _message: None)
+    pause = pause or time.sleep
     target_normalized = normalize_account_username(target_username)
+    pattern = rf"(?i)^(?:u/)?{re.escape(target_normalized)}$"
+    target_label = format_account_username(target_username)
 
-    selector = d(resourceId="com.reddit.frontpage:id/account_name")
-    for row in iter_selector_elements(selector):
+    for attempt in range(ACCOUNT_ROW_MAX_ATTEMPTS):
+        if attempt:
+            pause(0.75)
+            if not account_switcher_sheet_visible(d):
+                # A tap may have completed before its error was reported. Never
+                # tap the old row's position on the newly opened profile/feed.
+                log("Account sheet closed during selection; verifying the active account before continuing.")
+                return wait_for_account_switch(d, target_username, pause, safe_click)
+
+        log(f"Selecting {target_label} (attempt {attempt + 1}/{ACCOUNT_ROW_MAX_ATTEMPTS}).")
         try:
-            info = getattr(row, "info", {}) or {}
-            text = (info.get("text") or "").strip()
-        except Exception:
-            text = ""
-
-        if normalize_account_username(text) == target_normalized:
-            safe_click(d, row)
-            return True
-
-    fallback = d(textMatches=rf"(?i)^(?:u/)?{re.escape(target_normalized)}$")
-    if fallback.exists(timeout=0.5):
-        safe_click(d, fallback)
-        return True
+            # Construct fresh selectors on every attempt; do not reuse a row
+            # index or cached bounds after the account sheet animates.
+            for selector_kwargs in (
+                {"resourceId": "com.reddit.frontpage:id/account_name", "textMatches": pattern},
+                {"textMatches": pattern},
+            ):
+                row = d(**selector_kwargs)
+                if row.exists(timeout=0.5):
+                    safe_click(d, row)
+                    return True
+        except (RPCUnknownError, UiObjectNotFoundError) as exc:
+            if isinstance(exc, RPCUnknownError) and "StaleObjectException" not in str(exc):
+                raise
+            if attempt + 1 == ACCOUNT_ROW_MAX_ATTEMPTS:
+                raise RuntimeError(
+                    f"Could not select {target_label}: the account row kept changing "
+                    f"during {ACCOUNT_ROW_MAX_ATTEMPTS} attempts."
+                ) from exc
+            log("Account row became stale or disappeared; waiting briefly and finding it again.")
+        else:
+            if attempt + 1 < ACCOUNT_ROW_MAX_ATTEMPTS:
+                log(f"Account row for {target_label} is not visible yet; waiting before checking again.")
 
     return False
 
@@ -214,7 +234,7 @@ def switch_reddit_account(d, target_username: str, log, pause, safe_click) -> bo
         log(f"Visible labels after account-switcher attempts: {visible_texts(d)}")
         raise RuntimeError("Could not open the Reddit account switcher.")
 
-    if not select_account_row(d, target_username, safe_click):
+    if not select_account_row(d, target_username, safe_click, log=log, pause=pause):
         log(f"Visible account-switcher labels: {visible_texts(d)}")
         raise RuntimeError(f"The account {formatted_target} was not found in the Reddit account switcher.")
 

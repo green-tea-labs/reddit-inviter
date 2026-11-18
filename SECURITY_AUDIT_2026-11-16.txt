@@ -1,0 +1,340 @@
+SECURITY AUDIT: REDDIT ANDROID BOT
+Date: 2026-11-16
+Repository: C:\Development\reddit-android-bot
+Audited commit: df4e1a3ec2a42cfde32ecba8933618bead90470e
+Status: Review complete for the available local repository; remediation not applied.
+
+SCOPE AND RESULT
+
+This repository contains Python Android automation and a small server-rendered
+LAN dashboard. It does not contain the Pineapple Cactus website's frontend or
+backend. Those applications were not audited.
+
+The main priorities are dependency updates, enforcing the member-only invitation
+guard, restricting local file permissions, and limiting dashboard connections.
+Several installed dependencies have critical upstream advisories. That is a
+confirmed version match, not proof of a remotely exploitable path in this bot.
+
+Reviewed application source, the dashboard HTML/HTTP handler, account switching,
+posting/invitation controls, command construction, persistence, logging,
+dependencies, Git history, and relevant local Windows permissions/listeners.
+
+Evidence collected:
+  - Parsed all 18 tracked Python files; manually reviewed production security
+    boundaries. No eval/exec/os.system/pickle.load/yaml.load call was found by
+    the targeted AST check. This is not a general proof of injection safety.
+  - Existing regression suite: 52 tests passed on Python 3.13.14.
+  - Scanned 118 unique Git blobs reachable from local refs (2,647,971 bytes),
+    plus 19 runtime text/XML/JSON artifacts, using seven credential patterns.
+    No matches. No claim is made about every possible credential format,
+    screenshot content, inaccessible history, or files outside this repository.
+  - Queried OSV and PyPI for all 14 installed Python distributions. Five have
+    advisory matches; OSV returned 67 GHSA records after excluding duplicate
+    PYSEC/other record types. None of those GHSA records was withdrawn or dated
+    after this review. They are not 67 demonstrated application exploits.
+  - Used an ephemeral loopback-only server with synthetic tally data to verify
+    dashboard behavior. The largest concurrency probe was FOUR connections.
+    No exhaustion/load test was performed against the home server.
+  - All invitation checks used mocked devices. No ADB device connection,
+    Reddit posting, or real invitation was performed by audit checks.
+  - Local listener inventory: ADB at 127.0.0.1:5037; no listeners observed on
+    8765, 5555, 7912, or 9008. No matching Reddit scheduled tasks were found
+    on THIS PC. These observations do not describe the downstairs server.
+
+FINDING 1: INSTALLED DEPENDENCIES HAVE KNOWN SECURITY ADVISORIES
+Priority: Fix soon. Upstream severity ranges from moderate to critical;
+          exploitability through the reviewed application is not established.
+
+Location: requirements.txt:1 and the currently installed .venv packages.
+
+Package    Installed     Verified patched target*  OSV GHSA records
+certifi    2026.4.22     2026.10.18                1
+idna       3.13          3.15                      1
+pillow     12.2.0        13.0.0                   56
+pip        26.0.1        26.2.0                    4
+urllib3    2.6.3         2.8.0                     5
+
+* These releases exist on PyPI, meet the current Python version requirement,
+  cover the fixes reported by the retrieved advisories, and their PyPI release
+  endpoints reported no advisories at review time. They were NOT installed or
+  compatibility-tested in this audit. Recheck advisory data when deploying.
+
+Important examples and application reachability:
+  - certifi GHSA-6q48-6c7w-9gw2 concerns a trust bundle containing a root linked
+    to compromised intermediate keys. Connections that use this bundle can be
+    exposed to an on-path attacker. The bot's direct quiz request uses Python's
+    urllib.request/default SSL handling, not an explicit certifi bundle. No
+    affected certifi-based production request path was demonstrated here.
+    https://github.com/certifi/python-certifi/security/advisories/GHSA-6q48-6c7w-9gw2
+  - Pillow advisories include native memory corruption and denial of service.
+    For example, GHSA-8g5g-8vmr-9782 affects a particular JPEG scaling path.
+    The bot decodes phone screenshots via Pillow; it does not expose an image
+    upload endpoint, and rendered Reddit content is not the original image
+    file passed directly to Pillow. No malicious screenshot exploit was tried.
+    https://github.com/python-pillow/Pillow/security/advisories/GHSA-8g5g-8vmr-9782
+  - urllib3 advisories include proxy TLS policy errors, redirect handling, and
+    streaming/decompression resource exhaustion. The installed UIAutomator
+    transport uses stdlib HTTP over ADB; the relevant vulnerable proxy/streaming
+    usage was not found in application code.
+    https://github.com/urllib3/urllib3/security/advisories/GHSA-8988-9cw3-xx77
+  - pip findings concern installation paths/archives and apply during package
+    management, not merely because the bot is running. One requires a malicious
+    package index. This still warrants updating the deployment tool.
+    https://github.com/pypa/pip/pull/14110
+  - idna GHSA-65pc-fj4g-8rjx concerns expensive processing of crafted domain
+    names. Application outbound hosts are constants; no user-supplied host
+    input to this API was found.
+    https://github.com/kjd/idna/security/advisories/GHSA-65pc-fj4g-8rjx
+
+requirements.txt contains only unpinned 'uiautomator2'. Installations therefore
+do not reproduce the reviewed direct or transitive versions, and there are no
+locally recorded artifact hashes.
+
+Remediation: update in a separate test environment, run the regression suite
+and phone dry runs, then deploy a reviewed lock/constraints set with hashes.
+Record the same inventory on the home server; this .venv is not its inventory.
+Use a repeatable dependency-advisory check during updates.
+https://pip.pypa.io/en/stable/topics/secure-installs/
+
+FINDING 2: MEMBER-ONLY INVITATIONS DO NOT FAIL CLOSED
+Severity: Medium; potentially high impact if a moderator invitation is accepted.
+Confidence: Confirmed control-flow failure with a mocked unchanged checkbox.
+
+Location: daily_inviter/reddit_inviter.py:1300-1339.
+
+The native path attempts to untick 'invite as moderator' but does not re-read
+the checkbox before pressing Send. A tap returning without an exception does
+not prove the toggle changed. The fallback text/description/geometry send paths
+also do not enforce this role check as a shared precondition.
+
+Reproduction: the audit provided a checkbox that remained checked after the
+toggle attempt. invite_user() still called the native Send control and returned
+'success'. Every phone method and invitation action was mocked.
+
+Impact: if the role checkbox is checked and the toggle fails to change it,
+automation can issue a moderator invitation instead of the intended member
+invitation. This audit did not observe an actual moderator invitation or grant;
+the recipient would still have to accept, and available powers depend on Reddit.
+
+Remediation: put role verification immediately before every possible Send path.
+Read the resulting state after any toggle; abort on checked or ambiguous state
+where role selection is expected. Verify the intended community and recipient
+in the same pre-send guard. Add tests for a missed toggle, unreadable state,
+missing/replaced controls, and every fallback send path.
+
+FINDING 3: OTHER AUTHENTICATED WINDOWS USERS CAN MODIFY EXECUTED CODE
+Severity: Medium, local attack prerequisite.
+Confidence: Confirmed filesystem ACLs on this PC; no second-account exploit.
+
+Location: repository directory and sampled files including
+daily_inviter/reddit_inviter.py, daily_inviter/lan_status_server.py,
+console_output.py, and .venv/Scripts/python.exe.
+
+Get-Acl reports an inherited Allow entry granting NT AUTHORITY\Authenticated
+Users 'Modify, Synchronize'. BUILTIN\Users can also read/execute these files.
+These are broad ordinary Windows groups, separate from the explicit Codex
+sandbox grants.
+
+Impact: another authenticated local principal can replace code/interpreter
+files before the owner runs them. The replacement then runs with the runner's
+permissions and access to its authorized phone. Administrator execution and
+administrator privilege escalation were not established. The risk is lower
+if all accounts on this machine are equally trusted.
+
+Remediation: limit code/interpreter modification to the deployment owner,
+administrators, and necessary tooling principals. Give the runtime account
+read/execute access to code and write access only to a separate state/log
+directory where practical. Inspect the home-server deployment ACLs separately.
+No ACLs were changed; blanket permission removal could break legitimate access.
+
+FINDING 4: DASHBOARD CLIENTS CAN HOLD WORKER THREADS WITHOUT A DEADLINE
+Severity: Medium, availability; requires network access to the dashboard.
+Confidence: Confirmed in bounded localhost reproduction.
+
+Location: daily_inviter/lan_status_server.py:179.
+
+ThreadingHTTPServer allocates request threads without an application concurrency
+limit, and StatusHandler does not set a connection/header-read timeout.
+Four incomplete HTTP requests left four workers blocked; all four underlying
+connection timeouts were None. Resource exhaustion at large scale was inferred
+from this behavior and source, not attempted.
+
+HOST is 0.0.0.0, so when started the service listens on every IPv4 interface.
+Reachability from other computers still depends on firewall/network rules.
+An accessible client can hold growing numbers of sockets/threads. Request
+logging also writes continuously to an unbounded file, adding a separate disk
+pressure path under sustained traffic.
+
+Remediation: add finite header/read/write deadlines, bound concurrent work,
+limit request rates and logged request length, and restrict network access.
+For ongoing network use, consider a server/proxy with these controls built in.
+Keep diagnostic archives if desired; storage capacity does not replace per-
+connection limits. Validate with a small partial-request test that workers
+expire and that the concurrency cap does not block unrelated work indefinitely.
+https://docs.python.org/3/library/http.server.html
+
+FINDING 5: DASHBOARD STATUS AND INTERNAL ERRORS REQUIRE NO AUTHENTICATION
+Severity: Low for the currently exposed read-only information.
+Confidence: Confirmed HTTP behavior; external network exposure not tested.
+
+Location: daily_inviter/lan_status_server.py:30, 74-108, 167-172.
+
+An unauthenticated GET /status.json returns invitation totals/history, last
+update time, state, and the server's LAN-address hint. A simulated tally read
+failure exposed the underlying exception and synthetic absolute filesystem
+path in 'state'. HTML and JSON are served over plaintext HTTP. Arbitrary Host
+headers are accepted. This does not by itself prove a browser DNS-rebinding
+exploit; browser policies and network exposure were not tested.
+
+Impact: anyone able to reach the service can inspect this operational data and
+some diagnostic details. The route does NOT expose invited usernames, arbitrary
+files, Reddit credentials, or controls to send invitations. It is not an
+unauthenticated remote-code-execution endpoint.
+
+Remediation: make loopback the default and opt into a restricted LAN address,
+or put the dashboard behind authenticated HTTPS/VPN access if sharing is needed.
+An owner-approved isolated LAN may deliberately accept this low-sensitivity
+exposure. Return generic error states to clients; keep exceptions in protected
+logs. Allowlist routes/Host values and return 404 for unknown routes.
+
+FINDING 6: HTTP REQUEST LOGGING PRESERVES TERMINAL CONTROL CHARACTERS
+Severity: Low, log integrity/display manipulation.
+Confidence: Confirmed with a synthetic request line passed to the handler.
+
+Location: daily_inviter/lan_status_server.py:174-175 and console_output.py:84-99.
+
+The overridden log_message writes request text directly through Python logging,
+instead of the base handler's control-character sanitization. The audit verified
+that an ESC terminal-control sequence survives into the log sink. A reachable
+client can therefore put display-control text in logs; rendering it in a terminal
+that interprets those sequences can conceal or distort displayed output.
+No terminal code execution or credential theft was demonstrated.
+
+Remediation: escape control characters in untrusted request/UI text, retain
+structured timestamp/source fields, and bound field length. Keep normal Unicode
+content supported. Test with ESC, carriage returns, and long request targets.
+
+PRIVACY AND HARDENING OBSERVATIONS
+
+These are distinct from demonstrated remote application exploits:
+
+  - Raw diagnostics: console_output.py:50 enables dependency DEBUG logs and
+    logs complete arguments; daily_poster/daily_puzzle_reddit_poster.py:216
+    captures full hierarchy/screenshots on failure without checking the active
+    app first. Notifications or an unrelated screen could be captured. Logs
+    inherit broad read access on this PC. No credential-pattern matches were
+    found in the 19 text artifacts checked. Keep verbose logging, but protect
+    access and redact secrets if future scripts accept them. A text scan cannot
+    establish whether screenshots contain sensitive content.
+
+  - Runtime data in Git: daily_inviter/invited_users.txt contains 49,116 lines
+    and is tracked, along with tallies, post-history JSON, and bytecode. This
+    exposes the collected invitation/processing dataset to repository readers
+    and every clone. Repository public/private status was not verified. Public
+    usernames are not passwords, but the collected targeting history should
+    usually be private runtime state. Preserve data when migrating it out of
+    source control. Removing current files does not remove old Git history;
+    a history rewrite would need separate coordination and was not performed.
+
+  - Discovery output: discover_ui.py:36-43 writes ui_*.xml in the repository
+    root. The project .gitignore covers /logs/ and source_progress.json only,
+    so discovery snapshots are not protected by project ignore rules. None
+    were tracked at review time. Route them into the protected log directory
+    and add project ignore rules for state, diagnostics, .venv and bytecode.
+
+  - Command construction: daily_inviter/reddit_inviter.py:886 interpolates the
+    subreddit into a double-quoted Android shell string. debug_reddit_feed.py
+    and benchmark_inviter.py accept unrestricted --subreddit values; a mocked
+    check showed shell substitution syntax reaches d.shell unchanged. The main
+    inviter CLI uses an allowlist. No lower-trust remote source for a malicious
+    subreddit value was found, so this is not rated as a remote command-injection
+    vulnerability. Validate subreddit syntax and pass a shell-escaped argument
+    list before reusing this helper with external input. No injected command
+    was executed during the audit.
+
+  - Outbound API bounds: midday_quiz_reddit_poster.py:248-278 uses HTTPS and a
+    30-second socket timeout, but reads the complete response without a byte
+    cap and trusts arbitrary quiz id/description lengths. Its URL is constant;
+    no user-controlled SSRF target was found. Add a response-size cap, schema/
+    length checks, bounded redirects to approved HTTPS hosts, and an overall
+    deadline. This mainly limits damage from a faulty/compromised upstream.
+
+  - Shared phone/state: entry points have no shared inter-process phone lock.
+    Concurrent runs can switch accounts/screens between verification and Send,
+    and history/tally writes are not atomic or locked. History read failures
+    also fall back to an empty history (daily_puzzle_reddit_poster.py:136;
+    reddit_inviter.py:255), allowing duplicate actions after corruption.
+    These are operational authorization/integrity risks, not demonstrated
+    attacker-driven exploits. Use a per-device run lock, atomic persistence,
+    explicit recovery for damaged state, and a final account/context check.
+
+  - Device selection: preflight queries explicitly use 127.0.0.1:5037 while
+    u2.connect() can honor environment-selected ADB host/device settings.
+    Pin the intended serial/client and use the same selection for preflight
+    and actions. No exposed ADB listener was observed on this PC. Phone-side
+    Wi-Fi debugging, installed helper exposure and Android patch state remain
+    unverified.
+
+CHECKS THAT DID NOT PRODUCE AN EXPLOIT FINDING
+
+  - The status handler is BaseHTTPRequestHandler, not a static-file server.
+    A traversal-shaped URL returned the dashboard, not requirements.txt.
+  - Tally rows must match fixed date/integer fields. A script-markup row was
+    rejected. The HTML renderer lacks general escaping/CSP, but no remotely
+    writable HTML value or executable tally-derived injection was demonstrated.
+    Add escaping/security headers as defense in depth, not as a claimed XSS fix.
+  - No database, SQL queries, user login sessions, upload endpoint or mutating
+    HTTP route exists in this repository; conventional SQL injection, session
+    hijacking, object-level API authorization and mutating-route CSRF were not
+    applicable to the dashboard reviewed.
+  - The application does not deliberately disable TLS certificate verification.
+  - Normal post text is passed through UIAutomator text APIs, not a shell text
+    command. Account fallback regexes escape configured account names.
+  - Account switching raises when the intended account cannot be selected;
+    secure-lock handling requires manual unlocking. Existing dry-run tests
+    confirm final posting/invitation actions are skipped on the tested paths.
+  - Dependency imports alone do not create application run logs. Main log
+    files use exclusive creation and live under a Git-ignored directory.
+
+RECOMMENDED IMPLEMENTATION ORDER
+
+1. Test and deploy the patched dependencies, then lock versions/hashes. Check
+   the downstairs machine's versions independently.
+2. Enforce and test the member-only role/account/community guard before every
+   Send path; serialize all scripts that operate the same phone.
+3. Restrict deployment/interpreter/log ACLs to the intended accounts.
+4. Restrict dashboard binding/access; add connection deadlines, bounded work,
+   sanitized logs and generic client error responses.
+5. Move runtime data/diagnostics outside tracked source, make state writes
+   atomic, and add input/response bounds.
+
+VALIDATION LIMITS AND ARTIFACTS
+
+This is an application source/dependency/local-configuration audit, not a
+penetration test of the home network or a certification that the app is secure.
+No internet-facing deployment, home-server firewall, router port forwarding,
+other site's source, live phone, Reddit account permissions, backups, or native
+binary internals were examined. Vulnerability queries cover Python package
+metadata; they are not a full Windows/Python/OpenSSL/ADB binary patch audit.
+No Bandit or Gitleaks installation was used; the exact custom checks are saved
+for review and their secret-pattern coverage is explicitly limited above.
+
+Production source, dependencies, history/tally data, firewall rules, scheduled
+tasks and ACLs were not changed. Only this report and ignored audit artifacts
+were created. Existing tests passed with the original dependency versions.
+
+Evidence directory:
+C:\Development\reddit-android-bot\logs\security_audit\2026-11-16\
+  audit_checks.py             Bounded local/mock probes and metadata queries
+  audit_evidence.json         Source scan, dashboard and role-guard evidence;
+                             installed package inventory and OSV/PyPI responses
+  summarize_dependencies.py   Advisory and patched-release verification
+  advisories.json            67 fetched GHSA records, dates/severity/references
+  candidate_versions.json    Patched-release existence and PyPI advisory checks
+  additional_checks.py        Local log/input/runtime-secret-pattern probes
+  additional_evidence.json   Redacted outcomes of those checks
+  filesystem_permissions.json Sampled broad local access-control entries
+  host_observations.json     Relevant listeners and matching scheduled tasks
+
+The evidence directory is Git-ignored and can contain operational metadata.
+Keep it private when sharing the summary report.

@@ -25,6 +25,8 @@ The account switcher dismisses simple swipe locks and accepts account labels wit
 
 Account-sheet detection uses one hierarchy snapshot, waits for the menu to appear, and retries a missed tap once. An already-open sheet is not tapped closed. A profile's `u/name` alone is not treated as an open account sheet.
 
+Account-row selection also retries up to three times if Reddit replaces the row during animation (`StaleObjectException`/`UiObjectNotFoundError`) or the row has not appeared yet. Each attempt re-queries the exact username after a brief wait. If the sheet closes during recovery, the script verifies the active account before continuing instead of tapping the old position. Unrelated errors still stop the run. The 17 November failure occurred here, before opening the post form; this specific fix requires copying the updated root `reddit_account_switcher.py` to the server.
+
 Deploy the poster scripts and their shared helper together: `reddit_account_switcher.py`, `daily_poster/daily_puzzle_reddit_poster.py`, `daily_poster/daily_challenge_reddit_poster.py`, and `daily_poster/midday_quiz_reddit_poster.py`. The latter two reject an older helper that lacks diagnostic support, reporting its exact path before interacting with the phone. Diagnostic capture is best-effort and cannot replace the original posting/account-switching exception.
 
 ## Navigation tests
