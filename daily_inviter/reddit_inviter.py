@@ -150,6 +150,7 @@ SWIPE_X_JITTER_PX = 28
 
 # File that stores usernames already invited across previous runs.
 INVITED_USERS_FILE = Path(__file__).with_name("invited_users.txt")
+UNCERTAIN_USERS_FILE = Path(__file__).with_name("uncertain_invites.txt")
 DAILY_TALLY_FILE = Path(__file__).with_name("daily_invite_tally.txt")
 SOURCE_PROGRESS_FILE = Path(__file__).with_name("source_progress.json")
 
@@ -430,22 +431,22 @@ def _visible_feedback_texts(d) -> list[str]:
     return texts
 
 
+def classify_invite_feedback(message: str) -> str:
+    """Only explicit result messages count; invitation drafts are not receipts."""
+    message = message.strip()
+    if re.fullmatch(r"(?i)(?:user )?already invited[.!]?", message):
+        return "already_invited"
+    if re.search(r"(?i)unknown error|failed|try again|rate.?limit|already invited", message):
+        return "error"
+    if re.fullmatch(r"(?i)(?:invite sent|invitation sent|successfully invited(?: .+)?|you have successfully invited(?: .+)?)[.!]?", message):
+        return "success"
+    return ""
+
+
 def wait_for_feedback_message(d, timeout: float = 3.0) -> tuple[str, str, list[str]]:
     """Return (message, source, observed_toasts) for post-invite feedback."""
     deadline = time.monotonic() + timeout
     observed_toasts: list[str] = []
-    feedback_patterns = [
-        r"(?i)unknown error",
-        r"(?i)successfully invited",
-        r"(?i)you have successfully invited",
-        r"(?i)invite sent",
-        r"(?i)invited",
-        r"(?i)success",
-        r"(?i)failed",
-        r"(?i)try again",
-        r"(?i)already invited",
-        r"(?i)rate limit",
-    ]
 
     while time.monotonic() < deadline:
         toast_wait = min(0.5, max(0.1, deadline - time.monotonic()))
@@ -455,28 +456,13 @@ def wait_for_feedback_message(d, timeout: float = 3.0) -> tuple[str, str, list[s
                 cleaned = str(message).strip()
                 if cleaned and cleaned not in observed_toasts:
                     observed_toasts.append(cleaned)
-                if cleaned:
+                if classify_invite_feedback(cleaned):
                     return (cleaned, "toast", observed_toasts)
         except Exception:
             pass
 
-        for pattern in feedback_patterns:
-            for selector in (
-                d(textMatches=pattern),
-                d(descriptionMatches=pattern),
-            ):
-                try:
-                    if selector.exists(timeout=0.2):
-                        info = getattr(selector, "info", {}) or {}
-                        for key in ("text", "contentDescription"):
-                            value = (info.get(key) or "").strip()
-                            if value:
-                                return (value, "ui-selector", observed_toasts)
-                except Exception:
-                    continue
-
         for text in _visible_feedback_texts(d):
-            if any(re.search(pattern, text) for pattern in feedback_patterns):
+            if classify_invite_feedback(text):
                 return (text, "ui-hierarchy", observed_toasts)
 
         pause(0.1)
@@ -1231,7 +1217,9 @@ def invite_user(d, username: str, dry_run: bool = False) -> str:
 
     Returns:
         'success'   – invite confirmed (or dry-run skipped)
-        'error'     – 'Unknown error' toast detected
+        'already_invited' – Reddit explicitly confirms a previous invitation
+        'uncertain' – Send was clicked but no explicit result was observed
+        'error'     – explicit failure feedback detected
         'not_found' – couldn't locate the invite UI (doesn't count toward error limit)
     """
     log(f"  [{username}] Locating invite option...")
@@ -1250,12 +1238,18 @@ def invite_user(d, username: str, dry_run: bool = False) -> str:
     )
 
     if not invite_btn.exists(timeout=2):
+        # Mature-profile dialogs can arrive after the initial profile check.
+        # Dismiss them before tapping menu coordinates behind the dialog.
+        dismiss_nsfw_modal(d)
         log(f"  [{username}] Opening profile overflow via top-right coordinate.")
         safe_tap_relative(d, *COORDINATE_FALLBACKS["profile_more_actions"])
         pause(1.5)
         invite_btn = d(textMatches=r"(?i)invite.*communit.*|communit.*invite.*|^invite$")
 
         if not invite_ui_visible():
+            if dismiss_nsfw_modal(d):
+                safe_tap_relative(d, *COORDINATE_FALLBACKS["profile_more_actions"])
+                pause(1.5)
             overflow = None
             for desc in ("More profile actions", "More options"):
                 candidate = d(description=desc)
@@ -1347,23 +1341,20 @@ def invite_user(d, username: str, dry_run: bool = False) -> str:
             log(f"  [{username}] Feedback after send ({feedback_source}): {feedback_message}")
         else:
             log(f"  [{username}] Feedback after send: {feedback_message}")
-        normalized_feedback = feedback_message.lower()
-
-        if "unknown error" in normalized_feedback:
-            log(f"  [{username}] Invite failed — already invited or rate-limited.")
-            return "error"
-
-        if any(token in normalized_feedback for token in ("successfully invited", "invite sent", "invited", "success")):
+        result = classify_invite_feedback(feedback_message)
+        if result == "already_invited":
+            log(f"  [{username}] Reddit confirms this user was already invited.")
+            return result
+        if result == "success":
             log(f"  [{username}] Invite sent!")
             return "success"
 
-        if any(token in normalized_feedback for token in ("failed", "try again", "rate limit", "already invited")):
+        if result == "error":
             log(f"  [{username}] Invite failed based on feedback text.")
             return "error"
 
-    # No toast detected — Reddit sometimes gives no feedback on success
-    log(f"  [{username}] No toast detected — assuming success.")
-    return "success"
+    log(f"  [{username}] No explicit send confirmation — delivery uncertain.")
+    return "uncertain"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1556,6 +1547,17 @@ def run_invite_loop(
 
             normalized = normalize_username(username)
 
+            # Returning from a profile can reset the list's scroll position.
+            # Never reuse coordinates from before that navigation.
+            current_points = {
+                normalize_username(name): location
+                for location, name in get_visible_usernames(d)
+            }
+            if normalized not in current_points:
+                log(f"  u/{username} moved out of view; deferring until visible again.")
+                continue
+            point = current_points[normalized]
+
             if point[1] >= bottom_viewport_threshold:
                 if normalized in low_viewport_deferred:
                     log(f"u/{username} is still too low on screen — scrolling for more comments.")
@@ -1613,12 +1615,25 @@ def run_invite_loop(
                     log("Reached the requested invitation limit.")
                     return ("invite_limit", total_invited)
 
-            elif result == "error":
+            elif result == "already_invited":
                 visited_users.add(normalized)
                 record_invited_user(username)
                 update_daily_tally(processed_delta=1)
+                consecutive_errors = 0
+                log(f"  u/{username} was already invited; saved locally, without counting a new invitation or an error.")
+
+            elif result == "uncertain":
+                visited_users.add(normalized)
+                with UNCERTAIN_USERS_FILE.open("a", encoding="utf-8") as handle:
+                    handle.write(normalized + "\n")
+                update_daily_tally(processed_delta=1)
+                log(f"  Delivery uncertain for u/{username}; saved separately to prevent duplicate attempts.")
+
+            elif result == "error":
+                visited_users.add(normalized)
+                update_daily_tally(processed_delta=1)
                 consecutive_errors += 1
-                log(f"  Marking u/{username} as handled and recording to invited list after error.")
+                log(f"  Skipping u/{username} for this session after error; not adding to invited history.")
                 log(f"  Consecutive errors: {consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}")
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     log(
@@ -1671,6 +1686,12 @@ def main(dry_run: bool = DRY_RUN, subreddit: str | None = None, max_runtime_seco
     source_deadline = deadline
     posts_in_source = 0
     visited_users = load_invited_users()
+    if UNCERTAIN_USERS_FILE.exists():
+        visited_users.update(
+            normalize_username(line)
+            for line in UNCERTAIN_USERS_FILE.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
     exhausted_post_keys: set[str] = set()
     exhausted_by_source: dict[str, set[str]] = {}
     cycle_start_visited = len(visited_users)

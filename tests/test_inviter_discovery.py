@@ -8,6 +8,23 @@ from daily_inviter import reddit_inviter as bot
 
 
 class InviterDiscoveryTests(unittest.TestCase):
+    def test_feedback_does_not_mistake_draft_or_failure_for_success(self):
+        for message in ["I've invited you to join my community, r/PineappleCactus", "invited", "success", ""]:
+            self.assertEqual(bot.classify_invite_feedback(message), "")
+        for message in ["Already invited", "User already invited"]:
+            self.assertEqual(bot.classify_invite_feedback(message), "already_invited")
+        for message in ["Invite failed", "Unknown error"]:
+            self.assertEqual(bot.classify_invite_feedback(message), "error")
+        for message in ["Invite sent!", "Invitation sent", "Successfully invited example"]:
+            self.assertEqual(bot.classify_invite_feedback(message), "success")
+
+    def test_feedback_reads_one_snapshot_instead_of_repeated_selectors(self):
+        device = Mock()
+        device.toast.get_message.return_value = None
+        device.dump_hierarchy.return_value = '<hierarchy><node text="Invite sent!" /></hierarchy>'
+        self.assertEqual(bot.wait_for_feedback_message(device)[0], "Invite sent!")
+        device.assert_not_called()
+
     def test_daily_priority_order_and_new_communities(self):
         self.assertEqual(bot.SOURCE_SUBREDDITS[:4], ["syllo", "QuizPlanetGame", "FitTheWord", "ColorPuzzleGame"])
         self.assertIn("LETTERSET", bot.SOURCE_SUBREDDITS)
@@ -72,6 +89,17 @@ class InviterDiscoveryTests(unittest.TestCase):
             self.assertTrue(bot.dismiss_nsfw_modal(device))
         click.assert_called_once()
 
+    def test_late_profile_warning_is_checked_before_menu_coordinate(self):
+        device = Mock()
+        device.return_value.exists.return_value = False
+        events = []
+        with patch.multiple(bot, pause=Mock(), log=Mock(),
+                            dismiss_nsfw_modal=Mock(side_effect=lambda *_: events.append("modal")),
+                            safe_tap_relative=Mock(side_effect=lambda *_: events.append("menu")),
+                            select_invite_community=Mock(return_value=False)):
+            self.assertEqual(bot.invite_user(device, "example_user", dry_run=True), "not_found")
+        self.assertEqual(events[:2], ["modal", "menu"])
+
     def test_unavailable_invite_is_skipped_for_session_without_permanent_record(self):
         device = Mock()
         device.window_size.return_value = (720, 1480)
@@ -97,6 +125,47 @@ class InviterDiscoveryTests(unittest.TestCase):
                             record_invited_user=Mock(), update_daily_tally=Mock()):
             self.assertEqual(bot.run_invite_loop(device, float("inf"), set(), "dailyguess"), ("rate_limited", 0))
             self.assertEqual(bot.invite_user.call_count, bot.MAX_CONSECUTIVE_ERRORS)
+            bot.record_invited_user.assert_not_called()
+
+    def test_profile_return_refreshes_next_username_coordinates(self):
+        device = Mock()
+        device.window_size.return_value = (720, 1480)
+        rows = [((100, 400), "first"), ((100, 600), "second")]
+        with patch.multiple(bot, MAX_COMMENT_SCROLLS=0,
+                            get_visible_usernames=Mock(side_effect=[rows, rows, [((100, 900), "second")]]),
+                            safe_tap_point=Mock(), pause=Mock(), dismiss_nsfw_modal=Mock(),
+                            _on_comment_screen=Mock(return_value=False),
+                            invite_user=Mock(return_value="not_found"), navigate_back_to_comments=Mock(),
+                            update_daily_tally=Mock()):
+            bot.run_invite_loop(device, float("inf"), set(), "dailyguess")
+            self.assertEqual(bot.safe_tap_point.call_args_list[-1].args, (device, 100, 900))
+
+    def test_already_invited_does_not_trigger_error_stop_or_count_success(self):
+        device = Mock()
+        device.window_size.return_value = (720, 1480)
+        rows = [((100, 400), f"player{i}") for i in range(bot.MAX_CONSECUTIVE_ERRORS + 1)]
+        with patch.multiple(bot, MAX_COMMENT_SCROLLS=0, get_visible_usernames=Mock(return_value=rows),
+                            safe_tap_point=Mock(), pause=Mock(), dismiss_nsfw_modal=Mock(),
+                            _on_comment_screen=Mock(return_value=False),
+                            invite_user=Mock(return_value="already_invited"), navigate_back_to_comments=Mock(),
+                            record_invited_user=Mock(), update_daily_tally=Mock()):
+            self.assertEqual(bot.run_invite_loop(device, float("inf"), set(), "dailyguess"), ("completed", 0))
+            self.assertEqual(bot.invite_user.call_count, len(rows))
+            self.assertTrue(all(call.kwargs == {"processed_delta": 1} for call in bot.update_daily_tally.call_args_list))
+
+    def test_uncertain_delivery_is_separate_from_confirmed_count(self):
+        device = Mock()
+        device.window_size.return_value = (720, 1480)
+        with tempfile.TemporaryDirectory() as directory, patch.multiple(
+                bot, MAX_COMMENT_SCROLLS=0, UNCERTAIN_USERS_FILE=Path(directory) / "uncertain.txt",
+                get_visible_usernames=Mock(return_value=[((100, 400), "new_player")]),
+                safe_tap_point=Mock(), pause=Mock(), dismiss_nsfw_modal=Mock(),
+                _on_comment_screen=Mock(return_value=False), invite_user=Mock(return_value="uncertain"),
+                navigate_back_to_comments=Mock(), record_invited_user=Mock(), update_daily_tally=Mock()):
+            self.assertEqual(bot.run_invite_loop(device, float("inf"), set(), "dailyguess"), ("completed", 0))
+            self.assertEqual(bot.UNCERTAIN_USERS_FILE.read_text().strip(), "new_player")
+            bot.record_invited_user.assert_not_called()
+            bot.update_daily_tally.assert_called_once_with(processed_delta=1)
 
     def main_patches(self, device):
         return patch.multiple(bot, source_order=Mock(return_value=["a", "b"]),
